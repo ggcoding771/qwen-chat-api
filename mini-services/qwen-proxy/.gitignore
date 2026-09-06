@@ -3,3 +3,4 @@
 storage-state.json
 node_modules/
 *.log
+logs.json

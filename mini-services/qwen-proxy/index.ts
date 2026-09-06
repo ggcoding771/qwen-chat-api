@@ -21,6 +21,8 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
 import { chromium, type BrowserContext, type Page } from 'playwright'
 import { createHash } from 'node:crypto'
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
 
 const PORT = 3030
 const QWEN_HOME = 'https://chat.qwen.ai'
@@ -47,6 +49,47 @@ const MODEL_ALIASES: Record<string, string> = {
 }
 
 const BROWSER_DATA_DIR = `${import.meta.dir}/.browser-data`
+
+// Persistent log storage — survives proxy restarts.
+// Stored as JSON in the proxy directory.
+const LOG_FILE = join(import.meta.dir, 'logs.json')
+const LOG_MAX = 2000 // keep last 2000 entries on disk
+
+// Debounced file writer — avoids writing on every log entry (which would
+// be slow during streaming). Writes at most once per 2 seconds.
+let logWritePending = false
+let logWriteTimer: any = null
+function scheduleLogWrite() {
+  if (logWriteTimer) return
+  logWriteTimer = setTimeout(() => {
+    logWriteTimer = null
+    try {
+      const data = JSON.stringify({
+        version: 1,
+        savedAt: Date.now(),
+        logs: proxyState.logs.slice(-LOG_MAX),
+      })
+      writeFileSync(LOG_FILE, data)
+    } catch (e: any) {
+      console.log(`[persist] failed to write logs: ${e.message}`)
+    }
+  }, 2000)
+}
+
+// Load persisted logs on startup
+function loadPersistedLogs() {
+  try {
+    if (!existsSync(LOG_FILE)) return
+    const raw = readFileSync(LOG_FILE, 'utf-8')
+    const data = JSON.parse(raw)
+    if (data?.logs && Array.isArray(data.logs)) {
+      proxyState.logs = data.logs
+      console.log(`[persist] loaded ${data.logs.length} logs from ${LOG_FILE}`)
+    }
+  } catch (e: any) {
+    console.log(`[persist] failed to load logs: ${e.message}`)
+  }
+}
 
 let context: BrowserContext | null = null
 let page: Page | null = null
@@ -106,8 +149,10 @@ function log(entry: Omit<LogEntry, 'id' | 'timestamp'>) {
     ...entry,
   }
   proxyState.logs.push(full)
-  if (proxyState.logs.length > 500) proxyState.logs.shift()
+  // Keep more logs in memory now that we persist to disk (2000 vs 500)
+  if (proxyState.logs.length > 2000) proxyState.logs.shift()
   console.log(`[log:${full.type}] ${full.prompt?.slice(0, 60) || ''} ${full.error ? 'ERR:' + full.error.slice(0, 80) : 'ok'}`)
+  scheduleLogWrite() // persist to disk (debounced)
   return full
 }
 
@@ -115,6 +160,9 @@ function log(entry: Omit<LogEntry, 'id' | 'timestamp'>) {
 // Browser bootstrap + login
 // ---------------------------------------------------------------------------
 async function bootstrapBrowser() {
+  // Load persisted logs from disk before starting the browser
+  loadPersistedLogs()
+
   console.log('[boot] launching persistent chromium context…')
   context = await chromium.launchPersistentContext(BROWSER_DATA_DIR, {
     headless: true,
@@ -503,33 +551,89 @@ async function streamResponse(
 }
 
 // ---------------------------------------------------------------------------
-// Scrape chat list from sidebar
+// Fetch chat list from Qwen API (via browser, with auth cookies)
 // ---------------------------------------------------------------------------
-async function scrapeChatList(): Promise<Array<{ id: string; title: string; preview: string }>> {
+async function fetchChatList(): Promise<Array<{ id: string; title: string; preview: string; updated_at?: number }>> {
   if (!page) return []
+  // Try Qwen's /api/v2/chats endpoint first (proper way).
+  // It's on the Baxia protected list, but GET requests from the page
+  // context often work because Baxia primarily intercepts mutations (POST).
+  const result = await page.evaluate(async () => {
+    try {
+      const res = await fetch('/api/v2/chats/?page=1&page_size=50', {
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      const text = await res.text()
+      return { status: res.status, body: text, method: 'api' }
+    } catch (e: any) {
+      return { status: 0, body: String(e?.message || e), method: 'api-error' }
+    }
+  })
+
+  if (result.status === 200) {
+    try {
+      const json = JSON.parse(result.body)
+      // The API returns { data: { data: [...] } } or { data: [...] }
+      const rawChats = json?.data?.data || json?.data || []
+      const chats = rawChats.map((c: any) => ({
+        id: c.id,
+        title: c.title || c.chat_title || 'Untitled',
+        preview: (c.title || c.chat_title || '').slice(0, 120),
+        updated_at: c.updated_at || c.create_time || undefined,
+      }))
+      console.log(`[chats] fetched ${chats.length} chats from Qwen API`)
+      return chats.slice(0, 50)
+    } catch (e: any) {
+      console.log(`[chats] API parse failed: ${e.message}`)
+    }
+  } else {
+    console.log(`[chats] API returned ${result.status}, falling back to DOM scrape`)
+  }
+
+  // Fallback: scrape the sidebar DOM.
+  // Qwen doesn't use <a href> tags — chats are rendered as divs with click
+  // handlers. We look for elements that contain chat IDs in their data
+  // attributes or have chat-like class names.
   return page.evaluate(() => {
-    // Qwen sidebar chat items — class names may vary; try several selectors
-    const selectors = [
-      '.chat-list-item',
-      '[class*="chat-history"] [class*="item"]',
-      '[class*="sidebar"] a[href*="/c/"]',
-      'a[href*="/c/"]',
-    ]
-    const seen = new Set<string>()
     const out: Array<{ id: string; title: string; preview: string }> = []
-    for (const sel of selectors) {
-      document.querySelectorAll(sel).forEach((el) => {
-        const href = el.getAttribute('href') || ''
-        const m = href.match(/\/c\/([a-f0-9-]+)/i)
-        if (!m) return
-        const id = m[1]
-        if (seen.has(id)) return
+    const seen = new Set<string>()
+
+    // Strategy 1: Find elements with data attributes containing chat IDs
+    document.querySelectorAll('[data-id], [data-chat-id], [data-key]').forEach((el) => {
+      const id = el.getAttribute('data-id') || el.getAttribute('data-chat-id') || el.getAttribute('data-key') || ''
+      if (/^[a-f0-9-]{8,}$/i.test(id) && !seen.has(id)) {
         seen.add(id)
         const title = (el.textContent || '').trim().slice(0, 120)
         out.push({ id, title, preview: title })
+      }
+    })
+
+    // Strategy 2: Find clickable elements in the sidebar that navigate to /c/
+    const sidebar = document.querySelector('[class*="sidebar"], [class*="chat-list"], [class*="history"]')
+    if (sidebar) {
+      sidebar.querySelectorAll('[class*="item"], [class*="chat-row"], [role="button"], [class*="list-item"]').forEach((el) => {
+        // Check if this element has an onClick that navigates, or contains text
+        const text = (el.textContent || '').trim()
+        if (text.length > 0 && text.length < 200) {
+          // Look for a UUID pattern in any nested element's attributes
+          const inner = el.querySelector('[class*="id"], [class*="key"]')
+          const allEls = [el, ...(inner ? [inner] : [])]
+          for (const e of allEls) {
+            for (const attr of ['data-id', 'data-key', 'id']) {
+              const v = e.getAttribute(attr) || ''
+              const m = v.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i)
+              if (m && !seen.has(m[1])) {
+                seen.add(m[1])
+                out.push({ id: m[1], title: text.slice(0, 120), preview: text.slice(0, 120) })
+                break
+              }
+            }
+          }
+        }
       })
-      if (out.length > 0) break
     }
+
     return out.slice(0, 50)
   })
 }
@@ -857,7 +961,7 @@ async function handleModels(res: ServerResponse) {
 async function handleChatsList(res: ServerResponse) {
   if (!ready || !page) return sendJSON(res, 503, { error: 'not ready' })
   try {
-    const chats = await pageMutex.acquire(() => scrapeChatList())
+    const chats = await pageMutex.acquire(() => fetchChatList())
     log({ type: 'chat_list', response: `${chats.length} chats` })
     return sendJSON(res, 200, {
       object: 'list',
@@ -934,7 +1038,7 @@ async function handleStateSet(req: IncomingMessage, res: ServerResponse) {
   return sendJSON(res, 200, { ok: true, chat: proxyState.chat })
 }
 
-function handleLogs(res: ServerResponse) {
+function handleLogs(req: IncomingMessage, res: ServerResponse) {
   const params = new URL(req.url || '', `http://localhost:${PORT}`).searchParams
   const limit = parseInt(params.get('limit') || '100', 10)
   const type = params.get('type')
@@ -1131,7 +1235,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/v1/chats/new') return await handleChatNew(res)
     if (req.method === 'GET' && url.pathname === '/v1/state') return handleStateGet(res)
     if (req.method === 'POST' && url.pathname === '/v1/state') return handleStateSet(req, res)
-    if (req.method === 'GET' && url.pathname === '/v1/logs') return handleLogs(res)
+    if (req.method === 'GET' && url.pathname === '/v1/logs') return handleLogs(req, res)
     if (req.method === 'GET' && url.pathname === '/v1/analytics') return handleAnalytics(res)
     if (req.method === 'POST' && url.pathname === '/debug/send') return await handleDebugSend(req, res)
     if (req.method === 'GET' && url.pathname === '/debug/inspect-mode') return await handleDebugInspectMode(res)
@@ -1154,6 +1258,18 @@ server.listen(PORT, async () => {
 
 const shutdown = async (sig: string) => {
   console.log(`\n[${sig}] shutting down…`)
+  // Flush logs to disk immediately
+  try {
+    const data = JSON.stringify({
+      version: 1,
+      savedAt: Date.now(),
+      logs: proxyState.logs.slice(-LOG_MAX),
+    })
+    writeFileSync(LOG_FILE, data)
+    console.log(`[persist] flushed ${proxyState.logs.length} logs to disk`)
+  } catch (e: any) {
+    console.log(`[persist] flush failed: ${e.message}`)
+  }
   try {
     await context?.close()
   } catch {}
