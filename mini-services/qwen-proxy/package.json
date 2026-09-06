@@ -2,12 +2,9 @@
   "name": "qwen-proxy",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
   "scripts": {
     "dev": "bun --hot run index.ts",
     "start": "bun run index.ts"
   },
-  "dependencies": {
-    "playwright": "^1.62.1"
-  }
+  "type": "module"
 }
