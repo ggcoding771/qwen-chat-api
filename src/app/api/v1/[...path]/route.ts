@@ -3,23 +3,51 @@ import { NextRequest } from 'next/server'
 export const runtime = 'edge'
 export const dynamic = 'force-dynamic'
 
-const PROXY_PORT = 3030
+const QWEN_PORT = 3030
+const DEEPSEEK_PORT = 3032
 
 /**
- * Catch-all proxy: forwards any /api/v1/* request to the qwen-proxy
- * mini-service on localhost:3030. Supports streaming (SSE) responses.
+ * Catch-all proxy with model-based routing:
  *
+ * - qwen* models → Qwen proxy (port 3030)
+ * - deepseek* models → DeepSeek proxy (port 3032)
+ * - Non-chat endpoints (models, chats, logs, etc.) → Qwen proxy (default)
+ *
+ * Supports streaming (SSE) responses.
  * Uses Edge runtime for Cloudflare Pages compatibility.
- *
- * NOTE: Edge runtime has a ~25s CPU time limit. For long streaming
- * responses (essays, etc.), use the direct proxy URL option in the
- * dashboard Setup tab — it connects browser→proxy directly, bypassing
- * Next.js entirely.
  */
 async function handler(req: NextRequest) {
   const path = req.nextUrl.pathname.replace(/^\/api\/v1/, '')
   const search = req.nextUrl.search
-  const target = `http://localhost:${PROXY_PORT}/v1${path}${search}`
+
+  // Determine which proxy to route to
+  let port = QWEN_PORT // default
+
+  if (path === '/chat/completions' && req.method === 'POST') {
+    // Read the body to check the model
+    const body = await req.text()
+    try {
+      const parsed = JSON.parse(body)
+      const model = parsed.model || ''
+      if (model.startsWith('deepseek')) {
+        port = DEEPSEEK_PORT
+      }
+    } catch {}
+    // Forward the body
+    return proxyTo(req, port, path, search, body)
+  }
+
+  return proxyTo(req, port, path, search)
+}
+
+async function proxyTo(
+  req: NextRequest,
+  port: number,
+  path: string,
+  search: string,
+  bodyOverride?: string
+) {
+  const target = `http://localhost:${port}/v1${path}${search}`
 
   const headers = new Headers()
   headers.set('Content-Type', req.headers.get('content-type') || 'application/json')
@@ -28,11 +56,13 @@ async function handler(req: NextRequest) {
   const init: RequestInit = {
     method: req.method,
     headers,
-    // @ts-expect-error - duplex is needed for streaming request bodies in undici
+    // @ts-expect-error - duplex is needed for streaming request bodies
     duplex: 'half',
   }
 
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
+  if (bodyOverride !== undefined) {
+    init.body = bodyOverride
+  } else if (req.method !== 'GET' && req.method !== 'HEAD') {
     init.body = await req.text()
   }
 
@@ -57,8 +87,9 @@ async function handler(req: NextRequest) {
       headers: respHeaders,
     })
   } catch (e: any) {
+    const provider = port === DEEPSEEK_PORT ? 'DeepSeek' : 'Qwen'
     return Response.json(
-      { error: { message: `Proxy unreachable: ${e.message}`, type: 'proxy_error' } },
+      { error: { message: `${provider} proxy unreachable: ${e.message}. Is the proxy running on port ${port}?`, type: 'proxy_error' } },
       { status: 502 }
     )
   }

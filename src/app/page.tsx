@@ -768,6 +768,13 @@ function PlaygroundTab({ proxyUrl }: { proxyUrl?: string }) {
         { id: 'qwen3.8-max', info: { name: 'Qwen3.8-Max' } },
       ]
 
+  // Add DeepSeek models (always available via the deepseek-proxy)
+  const allModels = [
+    ...modelOptions,
+    { id: 'deepseek-chat', info: { name: 'DeepSeek Chat', short_description: 'Instant mode — fast responses' } },
+    { id: 'deepseek-reasoner', info: { name: 'DeepSeek Reasoner', short_description: 'Deep thinking mode (R1)' } },
+  ]
+
   return (
     <div className="flex flex-col h-[calc(100vh-220px)]">
       {/* Toolbar */}
@@ -778,7 +785,7 @@ function PlaygroundTab({ proxyUrl }: { proxyUrl?: string }) {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {modelOptions.map((m) => (
+              {allModels.map((m) => (
                 <SelectItem key={m.id} value={m.id}>
                   <div className="flex flex-col">
                     <span className="font-medium">{m.info?.name || m.id}</span>
@@ -826,7 +833,7 @@ function PlaygroundTab({ proxyUrl }: { proxyUrl?: string }) {
               <p className="text-xs text-zinc-400 mt-1">
                 Mode: <span className="text-emerald-500 font-medium capitalize">{thinkingMode}</span>
                 {' \u00b7 '}
-                Model: <span className="text-emerald-500 font-medium">{modelOptions.find(m => m.id === model)?.info?.name || model}</span>
+                Model: <span className="text-emerald-500 font-medium">{allModels.find(m => m.id === model)?.info?.name || model}</span>
               </p>
             </div>
           ) : (

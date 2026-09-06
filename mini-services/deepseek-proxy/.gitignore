@@ -1,0 +1,6 @@
+.env
+.browser-data/
+*.json
+node_modules/
+*.log
+*.pid
