@@ -68,3 +68,4 @@ skills/
 # Tests
 tests/
 proxy.pid
+.vercel/
