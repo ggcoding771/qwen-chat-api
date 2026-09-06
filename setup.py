@@ -28,34 +28,45 @@ DASHBOARD_PORT = 3000
 
 # ── Check if we're running inside the venv ─────────────────────────────
 def in_venv():
-    return sys.prefix != sys.base_prefix
+    """Check if we're running in the project's venv."""
+    # Check if VENV_PYTHON exists and we're running it
+    try:
+        return os.path.realpath(sys.executable) == os.path.realpath(str(VENV_PYTHON))
+    except:
+        return False
 
 # ── Relaunch in venv if needed ────────────────────────────────────────
 def ensure_venv():
-    """If we're not in a venv, create one and relaunch."""
-    if in_venv():
-        return True  # Already in venv
+    """If rich/playwright aren't importable, create a venv and relaunch."""
+    # First check if we can import rich and playwright
+    try:
+        import rich
+        import playwright
+        return True  # Already have deps, no venv needed
+    except ImportError:
+        pass
 
+    # Check if venv already exists
     if VENV_PYTHON.exists():
-        # Venv exists, relaunch with it
         print(f"Using virtual environment at {VENV_DIR}")
         os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__] + sys.argv[1:])
         return True  # Never reached
 
     # Need to create venv
-    print("Creating virtual environment (one-time setup)...")
+    print("\nCreating virtual environment (one-time setup)...")
+    print("This installs rich + playwright + Chromium browser (~300MB download)")
     try:
         subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
-        print("Installing dependencies in venv (rich, playwright)...")
+        print("  Installing rich + playwright...")
         pip = str(VENV_DIR / "bin" / "pip")
         subprocess.check_call([pip, "install", "rich", "playwright"])
-        print("Installing Chromium browser for Playwright...")
+        print("  Installing Chromium browser...")
         subprocess.check_call([str(VENV_PYTHON), "-m", "playwright", "install", "chromium"])
-        print("Setup complete! Relaunching...")
+        print("\nSetup complete! Relaunching...\n")
         os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__] + sys.argv[1:])
         return True  # Never reached
     except Exception as e:
-        print(f"ERROR: Failed to create virtual environment: {e}")
+        print(f"\nERROR: Failed to create virtual environment: {e}")
         print(f"\nManual setup:")
         print(f"  python3 -m venv {VENV_DIR}")
         print(f"  {VENV_DIR}/bin/pip install rich playwright")
@@ -79,13 +90,24 @@ console = Console()
 
 # ── Session checks ────────────────────────────────────────────────────
 def check_qwen_session():
-    try:
-        import urllib.request
-        r = urllib.request.urlopen(f"http://localhost:{QWEN_PORT}/health", timeout=3)
-        data = json.loads(r.read())
-        return data.get("status") == "ok" and "sign_in" not in data.get("browser_url", "")
-    except:
-        return False
+    """Check if Qwen has a valid browser profile (not just if proxy is running)."""
+    # Check if browser data exists (means user has logged in before)
+    browser_data = QWEN_PROXY_DIR / ".browser-data"
+    storage_state = QWEN_PROXY_DIR / "storage-state.json"
+    if browser_data.exists() or storage_state.exists():
+        # Also check if proxy is running and logged in
+        try:
+            import urllib.request
+            r = urllib.request.urlopen(f"http://localhost:{QWEN_PORT}/health", timeout=3)
+            data = json.loads(r.read())
+            if data.get("status") == "ok":
+                return True
+        except:
+            pass
+        # Browser data exists but proxy not running — still return True
+        # because the session is saved
+        return True
+    return False
 
 def check_deepseek_session():
     session_file = DEEPSEEK_PROXY_DIR / "session.json"
@@ -127,15 +149,26 @@ async def browser_login(provider: str):
         f"[dim]Press Enter to open browser...[/dim]",
         border_style="green"
     ))
-    input()
+    try:
+        input()
+    except EOFError:
+        pass  # Non-interactive mode — proceed anyway
 
+    from playwright.async_api import async_playwright
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch_persistent_context(
-        str(data_dir),
-        headless=False,
-        args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        viewport={"width": 1280, "height": 800},
-    )
+    try:
+        browser = await pw.chromium.launch_persistent_context(
+            str(data_dir),
+            headless=False,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            viewport={"width": 1280, "height": 800},
+        )
+    except Exception as e:
+        console.print(f"\n[red]Failed to open browser: {e}[/red]")
+        console.print("[yellow]This usually means no display is available.[/yellow]")
+        console.print("[yellow]Make sure you're running this in a terminal with a desktop environment.[/yellow]")
+        await pw.stop()
+        return False
 
     page = await browser.newPage()
     await page.goto(login_url, wait_until="domcontentloaded")
@@ -229,7 +262,10 @@ def console_snippet_login(provider: str):
         f"7. Paste it back here\n",
         border_style="green"
     ))
-    input("Press Enter to see the snippet...")
+    try:
+        input("Press Enter to see the snippet...")
+    except EOFError:
+        pass
 
     snippet = """JSON.stringify({
   cookies: document.cookie.split('; ').map(c => {
@@ -342,11 +378,11 @@ def show_status():
 
 # ── Main ──────────────────────────────────────────────────────────────
 async def main():
-    # Step 0: Ensure we're in the venv
-    if not in_venv():
-        if not ensure_venv():
-            return
-        return  # ensure_venv will execv
+    # Step 0: Ensure deps are available (create venv if needed)
+    # ensure_venv() will execv (replace this process) if it creates a venv
+    ensure_venv()
+
+    # At this point, rich is importable (either system or venv)
 
     console.print(Panel.fit(
         "[bold green]Qwen + DeepSeek Chat API[/bold green]\n"
@@ -362,13 +398,53 @@ async def main():
     console.print(f"  DeepSeek:  {'[green]Logged in[/green]' if ds_ok else '[red]Not logged in[/red]'}")
 
     # Step 2: Login if needed
+    # First, ensure .env files have real credentials
+    qwen_env = QWEN_PROXY_DIR / ".env"
+    ds_env = DEEPSEEK_PROXY_DIR / ".env"
+
+    # Check if .env has placeholder values
+    needs_credentials = False
+    for env_file in [qwen_env, ds_env]:
+        if env_file.exists():
+            content = env_file.read_text()
+            if "your-email" in content or "your-password" in content:
+                needs_credentials = True
+                break
+
+    if needs_credentials:
+        console.print(Panel(
+            "[bold yellow]Credentials Setup[/bold yellow]\n\n"
+            "Enter your Qwen/DeepSeek email and password.\n"
+            "These are used for auto-login (saved locally, never sent anywhere else).",
+            border_style="yellow"
+        ))
+        try:
+            email = Prompt.ask("Email", default="")
+            password = Prompt.ask("Password", password=True, default="")
+        except (EOFError, KeyboardInterrupt):
+            email = ""
+            password = ""
+
+        if email and password:
+            for env_file in [qwen_env, ds_env]:
+                env_file.write_text(f"QWEN_EMAIL={email}\nQWEN_PASSWORD={password}\n")
+            console.print("[green]  Credentials saved to .env[/green]")
+        else:
+            console.print("[yellow]  No credentials entered — browser login required[/yellow]")
+
     if not qwen_ok:
         console.print(Panel("[bold yellow]Qwen Login Required[/bold yellow]", border_style="yellow"))
         console.print("  [bold]1[/bold] = Browser Login (opens a window, you log in)")
         console.print("  [bold]2[/bold] = Console Snippet (copy/paste from browser console)")
-        choice = Prompt.ask("Choose", choices=["1", "2"], default="1")
+        try:
+            choice = Prompt.ask("Choose", choices=["1", "2"], default="1")
+        except (EOFError, KeyboardInterrupt):
+            choice = "1"
         if choice == "1":
-            await browser_login("qwen")
+            success = await browser_login("qwen")
+            if not success:
+                console.print("[yellow]Browser login failed. Trying console snippet...[/yellow]")
+                console_snippet_login("qwen")
         else:
             console_snippet_login("qwen")
 
@@ -378,9 +454,15 @@ async def main():
                            border_style="yellow"))
         console.print("  [bold]1[/bold] = Browser Login (opens a window, you log in)")
         console.print("  [bold]2[/bold] = Console Snippet (copy/paste from browser console)")
-        choice = Prompt.ask("Choose", choices=["1", "2"], default="1")
+        try:
+            choice = Prompt.ask("Choose", choices=["1", "2"], default="1")
+        except (EOFError, KeyboardInterrupt):
+            choice = "1"
         if choice == "1":
-            await browser_login("deepseek")
+            success = await browser_login("deepseek")
+            if not success:
+                console.print("[yellow]Browser login failed. Trying console snippet...[/yellow]")
+                console_snippet_login("deepseek")
         else:
             console_snippet_login("deepseek")
 
