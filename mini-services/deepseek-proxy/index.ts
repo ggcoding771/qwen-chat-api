@@ -484,17 +484,54 @@ async function fillAndSend(text: string) {
   await input.press('Enter')
 }
 
+/**
+ * Stop the current generation by clicking the Stop button in the DeepSeek UI.
+ * Called when the API client (e.g. Cline) disconnects mid-stream.
+ */
+async function stopGeneration() {
+  if (!page) return
+  console.log('[stop] attempting to stop DeepSeek generation…')
+  try {
+    // DeepSeek shows a stop button during generation.
+    // Try several selectors since the exact class may vary.
+    const selectors = [
+      'button.stop-button',
+      '[class*="stop"]',
+      'div[class*="stop-icon"]',
+      'button[aria-label*="stop" i]',
+      'div[role="button"][class*="stop"]',
+    ]
+    for (const sel of selectors) {
+      const el = page.locator(sel).first()
+      const isVisible = await el.isVisible({ timeout: 1000 }).catch(() => false)
+      if (isVisible) {
+        await el.click({ timeout: 2000 })
+        console.log(`[stop] clicked: ${sel}`)
+        await page.waitForTimeout(500)
+        return
+      }
+    }
+    // Fallback: press Escape (sometimes cancels generation)
+    await page.keyboard.press('Escape').catch(() => {})
+    console.log('[stop] no stop button found — pressed Escape')
+  } catch (e: any) {
+    console.log(`[stop] failed: ${e.message}`)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Stream response (same approach as Qwen — intercept SSE via window vars)
 // ---------------------------------------------------------------------------
 async function streamResponse(
   onText: (delta: string) => void,
   onDone: () => void,
-  callbackName: string
+  callbackName: string,
+  isConnected?: () => boolean
 ) {
   if (!page) throw new Error('page not available')
 
   let streamDone = false
+  let aborted = false
   const startTime = Date.now()
   const HARD_TIMEOUT_MS = 300000
   let lastProcessedLen = 0
@@ -547,9 +584,22 @@ async function streamResponse(
 
     if (state.error) break
     if (state.done) { streamDone = true; break }
+
+    // Check if the client disconnected (e.g. Cline pressed Stop)
+    if (isConnected && !isConnected()) {
+      console.log('[stream] client disconnected — stopping generation')
+      aborted = true
+      break
+    }
+
     if (Date.now() - startTime > HARD_TIMEOUT_MS) break
 
     await new Promise((r) => setTimeout(r, 20))
+  }
+
+  // If the client disconnected, stop the DeepSeek generation immediately
+  if (aborted) {
+    await stopGeneration()
   }
 
   // Cleanup
@@ -665,24 +715,62 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
     res.write(makeChunk({ id: completionId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }))
 
     let fullText = ''
+    let clientDisconnected = false
+    const heartbeat = setInterval(() => {
+      if (clientDisconnected) return
+      try {
+        res.write(': heartbeat\n\n')
+      } catch (e) {
+        clientDisconnected = true
+        console.log('[req] heartbeat write failed — client disconnected')
+        clearInterval(heartbeat)
+      }
+    }, 2000)
+    req.on('close', () => { clientDisconnected = true; clearInterval(heartbeat) })
+    req.socket?.on('close', () => { clientDisconnected = true; clearInterval(heartbeat) })
+    res.on('close', () => { clientDisconnected = true; clearInterval(heartbeat) })
+    const isConn = () => {
+      if (clientDisconnected) return false
+      if (req.socket?.destroyed || res.destroyed) {
+        clientDisconnected = true
+        clearInterval(heartbeat)
+        return false
+      }
+      return true
+    }
+
     try {
       await pageMutex.acquire(async () => {
         const cbName = await executeSend() as any
         fullText = await streamResponse(
-          (text) => { res.write(makeChunk({ id: completionId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })) },
+          (text) => {
+            if (!res.writableEnded && !clientDisconnected) {
+              res.write(makeChunk({ id: completionId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] }))
+            }
+          },
           () => {},
-          cbName
+          cbName,
+          isConn
         )
       })
-      res.write(makeChunk({ id: completionId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }))
-      res.write('data: [DONE]\n\n')
-      res.end()
-      log({ type: 'chat', model, prompt: promptToSend.slice(0, 200), response: fullText.slice(0, 200), durationMs: Date.now() - startTime, mode: desiredMode, isContinuation, tokensIn: Math.ceil(promptToSend.length / 4), tokensOut: Math.ceil(fullText.length / 4) })
+      if (!res.writableEnded && !clientDisconnected) {
+        res.write(makeChunk({ id: completionId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }))
+        res.write('data: [DONE]\n\n')
+        res.end()
+      }
+      log({ type: 'chat', model, prompt: promptToSend.slice(0, 200), response: fullText.slice(0, 200), durationMs: Date.now() - startTime, mode: desiredMode, isContinuation, tokensIn: Math.ceil(promptToSend.length / 4), tokensOut: Math.ceil(fullText.length / 4), stopped: clientDisconnected })
     } catch (e: any) {
       log({ type: 'error', error: e.message, prompt: promptToSend.slice(0, 200) })
-      res.write(makeChunk({ id: completionId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], error: { message: e.message } }))
-      res.write('data: [DONE]\n\n')
-      res.end()
+      if (!res.writableEnded) {
+        res.write(makeChunk({ id: completionId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], error: { message: e.message } }))
+        res.write('data: [DONE]\n\n')
+        res.end()
+      }
+    } finally {
+      clearInterval(heartbeat)
+      req.removeAllListeners('close')
+      req.socket?.removeAllListeners('close')
+      res.removeAllListeners('close')
     }
     return
   }

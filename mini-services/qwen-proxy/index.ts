@@ -558,6 +558,30 @@ async function fillAndSend(text: string) {
 }
 
 /**
+ * Stop the current generation by clicking the Stop button in the Qwen UI.
+ * This is called when the API client (e.g. Cline) disconnects mid-stream.
+ * The Stop button has class `stop-button` and contains an `icon-stop` span.
+ */
+async function stopGeneration() {
+  if (!page) return
+  console.log('[stop] clicking Stop button in Qwen UI…')
+  try {
+    // The stop button is only visible during generation
+    const stopBtn = page.locator('.stop-button').first()
+    const isVisible = await stopBtn.isVisible({ timeout: 1000 }).catch(() => false)
+    if (isVisible) {
+      await stopBtn.click({ timeout: 2000 })
+      console.log('[stop] Stop button clicked')
+      await page.waitForTimeout(500) // give Qwen a moment to stop
+    } else {
+      console.log('[stop] Stop button not visible — generation may have finished')
+    }
+  } catch (e: any) {
+    console.log(`[stop] failed: ${e.message}`)
+  }
+}
+
+/**
  * Stream the response by intercepting Qwen's API SSE stream.
  *
  * How it works:
@@ -574,7 +598,8 @@ async function fillAndSend(text: string) {
 async function streamResponse(
   onText: (delta: string) => void,
   onDone: () => void,
-  callbackName: string
+  callbackName: string,
+  isConnected?: () => boolean
 ) {
   if (!page) throw new Error('page not available')
 
@@ -582,6 +607,7 @@ async function streamResponse(
   // was sent. We just need to poll the window variable and process chunks.
   let streamDone = false
   let streamError: string | null = null
+  let aborted = false
 
   const startTime = Date.now()
   const HARD_TIMEOUT_MS = 300000
@@ -662,6 +688,13 @@ async function streamResponse(
       break
     }
 
+    // Check if the client disconnected (e.g. Cline pressed Stop)
+    if (isConnected && !isConnected()) {
+      console.log('[stream] client disconnected — stopping generation')
+      aborted = true
+      break
+    }
+
     if (Date.now() - startTime > HARD_TIMEOUT_MS) {
       console.log('[stream] hard timeout (300s)')
       break
@@ -669,6 +702,11 @@ async function streamResponse(
 
     // Fast poll — 20ms for near-real-time streaming
     await new Promise((r) => setTimeout(r, 20))
+  }
+
+  // If the client disconnected, stop the Qwen generation immediately
+  if (aborted) {
+    await stopGeneration()
   }
 
   // Cleanup window variables
@@ -919,37 +957,79 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
     )
 
     let fullText = ''
+    // Track client connection state — when the client disconnects
+    // (e.g. Cline presses Stop), we abort the generation in the browser.
+    // Node.js doesn't always fire close events for SSE, so we use a
+    // heartbeat: periodically write a comment line to test the connection.
+    // If the write throws, the client has disconnected.
+    let clientDisconnected = false
+    const heartbeat = setInterval(() => {
+      if (clientDisconnected) return
+      try {
+        // Write an SSE comment (ignored by clients) to test connection
+        const ok = res.write(': heartbeat\n\n')
+        if (!ok) {
+          // Backpressure — but not necessarily disconnected
+        }
+      } catch (e) {
+        clientDisconnected = true
+        console.log('[req] heartbeat write failed — client disconnected')
+        clearInterval(heartbeat)
+      }
+    }, 2000) // every 2 seconds
+
+    // Also listen for close events
+    req.on('close', () => { clientDisconnected = true; console.log('[req] req close event'); clearInterval(heartbeat) })
+    req.socket?.on('close', () => { clientDisconnected = true; console.log('[req] socket close event'); clearInterval(heartbeat) })
+    res.on('close', () => { clientDisconnected = true; console.log('[req] res close event'); clearInterval(heartbeat) })
+    const isConnected = () => {
+      if (clientDisconnected) return false
+      // Also check socket destroyed
+      if (req.socket?.destroyed || res.destroyed) {
+        clientDisconnected = true
+        console.log('[req] socket destroyed — client disconnected')
+        clearInterval(heartbeat)
+        return false
+      }
+      return true
+    }
+
     try {
       await pageMutex.acquire(async () => {
         const cbName = await executeSend() as any
         fullText = await streamResponse(
           (text) => {
-            res.write(
-              makeChunk({
-                id: completionId,
-                object: 'chat.completion.chunk',
-                created,
-                model,
-                choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-              })
-            )
+            if (!res.writableEnded && !clientDisconnected) {
+              res.write(
+                makeChunk({
+                  id: completionId,
+                  object: 'chat.completion.chunk',
+                  created,
+                  model,
+                  choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+                })
+              )
+            }
           },
           () => {},
-          cbName
+          cbName,
+          isConnected
         )
       })
 
-      res.write(
-        makeChunk({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-        })
-      )
-      res.write('data: [DONE]\n\n')
-      res.end()
+      if (!res.writableEnded && !clientDisconnected) {
+        res.write(
+          makeChunk({
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          })
+        )
+        res.write('data: [DONE]\n\n')
+        res.end()
+      }
 
       log({
         type: 'chat',
@@ -962,21 +1042,29 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
         isContinuation,
         tokensIn: Math.ceil(promptToSend.length / 4),
         tokensOut: Math.ceil(fullText.length / 4),
+        stopped: clientDisconnected,
       })
     } catch (e: any) {
       log({ type: 'error', error: e.message, prompt: promptToSend.slice(0, 200), durationMs: Date.now() - startTime })
-      res.write(
-        makeChunk({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-          error: { message: e.message },
-        })
-      )
-      res.write('data: [DONE]\n\n')
-      res.end()
+      if (!res.writableEnded) {
+        res.write(
+          makeChunk({
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            error: { message: e.message },
+          })
+        )
+        res.write('data: [DONE]\n\n')
+        res.end()
+      }
+    } finally {
+      clearInterval(heartbeat)
+      req.removeAllListeners('close')
+      req.socket?.removeAllListeners('close')
+      res.removeAllListeners('close')
     }
     return
   }
