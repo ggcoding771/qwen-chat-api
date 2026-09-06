@@ -34,9 +34,10 @@ if (!QWEN_EMAIL || !QWEN_PASSWORD) {
   process.exit(1)
 }
 
-const MODEL_MAP: Record<string, string> = {
-  'qwen3.7-plus': 'qwen3.7-plus',
-  'qwen3.8-max': 'qwen3.8-max',
+// Map common OpenAI model names -> Qwen model ids.
+// For models not in this map, we pass them through as-is so any model
+// returned by /v1/models works automatically.
+const MODEL_ALIASES: Record<string, string> = {
   'qwen-plus': 'qwen3.7-plus',
   'qwen-max': 'qwen3.8-max',
   'gpt-4': 'qwen3.7-plus',
@@ -215,8 +216,13 @@ function simpleHash(s: string): string {
 }
 
 function mapModel(openaiModel: string | undefined): string {
-  if (!openaiModel) return MODEL_MAP.default
-  return MODEL_MAP[openaiModel] || MODEL_MAP.default
+  if (!openaiModel) return MODEL_ALIASES.default
+  // Pass through Qwen model IDs as-is (qwen3.7-plus, qwen3-max-coder, etc.)
+  if (openaiModel.startsWith('qwen') || openaiModel.startsWith('qvq')) {
+    return openaiModel
+  }
+  // Map common aliases
+  return MODEL_ALIASES[openaiModel] || MODEL_ALIASES.default
 }
 
 function sendJSON(res: ServerResponse, status: number, body: any) {
@@ -291,15 +297,58 @@ async function navigateToChat(chatId: string) {
 }
 
 async function setMode(desired: { thinking: boolean; search: boolean; deep_research: boolean }) {
-  // The Qwen UI defaults to "Auto" mode which automatically enables thinking
-  // and search as needed. Manually toggling modes via UI clicks is fragile
-  // (dropdowns can get stuck open and block the Send button).
+  if (!page) return
+  // Map our thinking flag to Qwen's three UI modes:
+  //   thinking=true  → "Thinking" (deep reasoning)
+  //   thinking=false → "Fast"      (no thinking)
+  //   (search/deep_research override to "Auto" which handles everything)
   //
-  // We track the desired mode in proxyState for display/logging, but we let
-  // Qwen's Auto mode handle the actual mode selection. This is more reliable
-  // than trying to click the mode dropdown.
+  // The Qwen mode selector is a dropdown with class
+  // `qwen-chat-v2-dropdown-menu-select`. Items are `qwen-chat-v2-dropdown-menu-item`.
+  const wantMode = desired.deep_research || desired.search ? 'Auto' : desired.thinking ? 'Thinking' : 'Fast'
+
+  try {
+    // Read current mode from the label
+    const currentMode = await page.evaluate(() => {
+      const el = document.querySelector('.qwen-chat-v2-dropdown-menu-select-label')
+      return el?.textContent?.trim() || null
+    })
+
+    if (currentMode === wantMode) {
+      console.log(`[ui] mode already '${wantMode}' — no change needed`)
+      proxyState.chat.mode = { ...desired }
+      return
+    }
+
+    console.log(`[ui] switching mode: ${currentMode} → ${wantMode}`)
+
+    // Click the mode selector to open the dropdown
+    const selector = page.locator('.qwen-chat-v2-dropdown-menu-select').first()
+    await selector.click({ timeout: 3000 })
+    await page.waitForTimeout(500)
+
+    // Click the desired mode item.
+    // We use text matching on the dropdown item label.
+    const modeItem = page.locator('.qwen-chat-v2-dropdown-menu-item', { hasText: wantMode }).first()
+    await modeItem.click({ timeout: 3000 })
+    await page.waitForTimeout(500)
+
+    // Verify the mode changed
+    const newMode = await page.evaluate(() => {
+      const el = document.querySelector('.qwen-chat-v2-dropdown-menu-select-label')
+      return el?.textContent?.trim() || null
+    })
+    console.log(`[ui] mode is now '${newMode}'`)
+
+    // Close any dropdown that might still be open
+    await page.keyboard.press('Escape').catch(() => {})
+  } catch (e: any) {
+    console.log(`[ui] mode switch failed: ${e.message} — continuing with current mode`)
+    // Make sure no dropdown is left open (would block the Send button)
+    await page.keyboard.press('Escape').catch(() => {})
+    await page.waitForTimeout(300)
+  }
   proxyState.chat.mode = { ...desired }
-  console.log(`[ui] mode set (tracked only, Auto handles actual): thinking=${desired.thinking} search=${desired.search}`)
 }
 
 async function fillAndSend(text: string) {
@@ -724,14 +773,85 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
 // ---------------------------------------------------------------------------
 // Other endpoints
 // ---------------------------------------------------------------------------
-async function handleModels(res: ServerResponse) {
-  return sendJSON(res, 200, {
-    object: 'list',
-    data: [
-      { id: 'qwen3.7-plus', object: 'model', created: 1732711466, owned_by: 'qwen', permission: [], root: 'qwen3.7-plus', parent: null },
-      { id: 'qwen3.8-max', object: 'model', created: 1732711466, owned_by: 'qwen', permission: [], root: 'qwen3.8-max', parent: null },
-    ],
+
+// Cache the real model list fetched from Qwen (refreshed every 5 min)
+let modelsCache: { data: any[]; fetchedAt: number } | null = null
+const MODELS_CACHE_MS = 5 * 60 * 1000
+
+async function fetchQwenModels(): Promise<any[]> {
+  if (!page) throw new Error('page not available')
+  // Fetch via the browser so Baxia tokens + auth cookies are attached.
+  // /api/v2/models/ is NOT on the protected list, so even a plain fetch
+  // from the page context works.
+  const result = await page.evaluate(async () => {
+    const res = await fetch('/api/v2/models/', { credentials: 'include' })
+    const text = await res.text()
+    return { status: res.status, body: text }
   })
+  if (result.status >= 400) {
+    throw new Error(`fetchQwenModels failed ${result.status}: ${result.body.slice(0, 200)}`)
+  }
+  const json = JSON.parse(result.body)
+  const rawModels = json?.data?.data || json?.data || []
+  // Normalize to OpenAI shape, preserving Qwen metadata in `info`
+  return rawModels.map((m: any) => ({
+    id: m.id,
+    object: 'model',
+    created: m.info?.meta?.updated_at || m.created || 1732711466,
+    owned_by: m.owned_by || 'qwen',
+    permission: [],
+    root: m.id,
+    parent: null,
+    // Qwen-specific metadata (capabilities, context length, etc.)
+    info: {
+      name: m.name || m.id,
+      description: m.info?.meta?.description || '',
+      short_description: m.info?.meta?.short_description || '',
+      capabilities: m.info?.meta?.capabilities || {},
+      max_context_length: m.info?.meta?.max_context_length || 0,
+      max_summary_generation_length: m.info?.meta?.max_summary_generation_length || 0,
+      chat_type: m.info?.meta?.chat_type || [],
+      thinking_format: m.info?.meta?.thinking_format || null,
+      auto_thinking: m.info?.meta?.auto_thinking || false,
+      preset: m.info?.preset || false,
+      is_active: m.info?.is_active ?? true,
+    },
+  }))
+}
+
+async function handleModels(res: ServerResponse) {
+  // Return cached if fresh
+  if (modelsCache && Date.now() - modelsCache.fetchedAt < MODELS_CACHE_MS) {
+    return sendJSON(res, 200, { object: 'list', data: modelsCache.data })
+  }
+  // Otherwise fetch fresh from Qwen
+  if (!ready || !page) {
+    // Fallback to a minimal hardcoded list if proxy isn't ready
+    return sendJSON(res, 200, {
+      object: 'list',
+      data: [
+        { id: 'qwen3.7-plus', object: 'model', created: 1732711466, owned_by: 'qwen', permission: [], root: 'qwen3.7-plus', parent: null, info: { name: 'Qwen3.7-Plus' } },
+        { id: 'qwen3.8-max', object: 'model', created: 1732711466, owned_by: 'qwen', permission: [], root: 'qwen3.8-max', parent: null, info: { name: 'Qwen3.8-Max' } },
+      ],
+    })
+  }
+  try {
+    const models = await fetchQwenModels()
+    modelsCache = { data: models, fetchedAt: Date.now() }
+    console.log(`[models] fetched ${models.length} models from Qwen`)
+    return sendJSON(res, 200, { object: 'list', data: models })
+  } catch (e: any) {
+    console.log(`[models] fetch failed: ${e.message} — using fallback`)
+    // Return cached (even if stale) or fallback list
+    if (modelsCache) return sendJSON(res, 200, { object: 'list', data: modelsCache.data })
+    return sendJSON(res, 200, {
+      object: 'list',
+      data: [
+        { id: 'qwen3.7-plus', object: 'model', created: 1732711466, owned_by: 'qwen', permission: [], root: 'qwen3.7-plus', parent: null, info: { name: 'Qwen3.7-Plus' } },
+        { id: 'qwen3.8-max', object: 'model', created: 1732711466, owned_by: 'qwen', permission: [], root: 'qwen3.8-max', parent: null, info: { name: 'Qwen3.8-Max' } },
+      ],
+    })
+  }
 }
 
 async function handleChatsList(res: ServerResponse) {
@@ -931,6 +1051,61 @@ async function handleDebugSend(req: IncomingMessage, res: ServerResponse) {
   }
 }
 
+// Debug endpoint: inspect mode selector DOM
+async function handleDebugInspectMode(res: ServerResponse) {
+  if (!ready || !page) return sendJSON(res, 503, { error: 'not ready' })
+  try {
+    // First, click the mode selector to open the dropdown
+    const modeSelector = page.locator('.qwen-chat-v2-dropdown-menu-select').first()
+    await modeSelector.click({ timeout: 3000 }).catch((e) => {
+      console.log(`[debug] mode selector click failed: ${e.message}`)
+    })
+    await page.waitForTimeout(800)
+
+    const info = await page.evaluate(() => {
+      const out: any = { modeElements: [], dropdownItems: [], currentMode: null }
+      // Find current mode label
+      const label = document.querySelector('.qwen-chat-v2-dropdown-menu-select-label')
+      if (label) out.currentMode = label.textContent?.trim()
+
+      // Find dropdown menu items (these appear after clicking)
+      document.querySelectorAll('.qwen-chat-v2-dropdown-menu-item, [class*="dropdown-menu-item"], [role="menuitem"], [role="option"]').forEach((el) => {
+        const t = (el.textContent || '').trim()
+        if (t && t.length < 50) {
+          out.dropdownItems.push({
+            cls: el.className.slice(0, 150),
+            text: t,
+            visible: el.offsetWidth > 0,
+            clickable: el.tagName === 'BUTTON' || el.getAttribute('role') === 'menuitem' || el.getAttribute('role') === 'option',
+          })
+        }
+      })
+      // Also find elements with Auto/Thinking/Fast text (might be in dropdown)
+      document.querySelectorAll('*').forEach((el) => {
+        if (el.children.length === 0) {
+          const t = (el.textContent || '').trim()
+          if ((t === 'Auto' || t === 'Thinking' || t === 'Fast' || t === '搜索' || t === '思考' || t === '自动' || t === '快速') && el.offsetWidth > 0) {
+            out.modeElements.push({
+              tag: el.tagName,
+              cls: el.className.slice(0, 150),
+              text: t,
+              parentCls: el.parentElement?.className?.slice(0, 150) || '',
+            })
+          }
+        }
+      })
+      return out
+    })
+
+    // Close the dropdown by pressing Escape
+    await page.keyboard.press('Escape').catch(() => {})
+
+    return sendJSON(res, 200, { ok: true, url: page.url(), info })
+  } catch (e: any) {
+    return sendJSON(res, 500, { error: e.message })
+  }
+}
+
 // ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
@@ -959,6 +1134,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/v1/logs') return handleLogs(res)
     if (req.method === 'GET' && url.pathname === '/v1/analytics') return handleAnalytics(res)
     if (req.method === 'POST' && url.pathname === '/debug/send') return await handleDebugSend(req, res)
+    if (req.method === 'GET' && url.pathname === '/debug/inspect-mode') return await handleDebugInspectMode(res)
     sendJSON(res, 404, { error: { message: `No route for ${req.method} ${url.pathname}` } })
   } catch (e: any) {
     console.error('[server] unhandled:', e)

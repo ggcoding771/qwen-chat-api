@@ -37,6 +37,7 @@ import {
   RefreshCw,
   ExternalLink,
   Plus,
+  Brain,
 } from 'lucide-react'
 
 // ---------------------------------------------------------------------------
@@ -571,24 +572,62 @@ function ChatsTab({ proxyInfo, proxyUrl }: { proxyInfo: any; proxyUrl?: string }
 // ---------------------------------------------------------------------------
 // Playground Tab
 // ---------------------------------------------------------------------------
+type ThinkingMode = 'auto' | 'thinking' | 'fast'
+
+interface QwenModel {
+  id: string
+  info?: {
+    name?: string
+    short_description?: string
+    capabilities?: { vision?: boolean; thinking?: boolean; search?: boolean }
+    max_context_length?: number
+    is_active?: boolean
+  }
+}
+
 function PlaygroundTab({ proxyUrl }: { proxyUrl?: string }) {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [model, setModel] = useState('qwen3.7-plus')
+  const [models, setModels] = useState<QwenModel[]>([])
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>('auto')
   const [streaming, setStreaming] = useState(false)
+  const [thinking, setThinking] = useState(false)
   const abortRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+
+  // Fetch available models from the proxy
+  useEffect(() => {
+    const fetchModels = async () => {
+      try {
+        const r = await fetch(apiUrl('/models', proxyUrl))
+        if (!r.ok) return
+        const data = await r.json()
+        const list = (data.data || []).filter((m: QwenModel) => m.info?.is_active !== false)
+        if (list.length > 0) {
+          setModels(list)
+          if (!list.find((m: QwenModel) => m.id === model)) {
+            setModel(list[0].id)
+          }
+        }
+      } catch {}
+    }
+    fetchModels()
+    const interval = setInterval(fetchModels, 60000)
+    return () => clearInterval(interval)
+  }, [proxyUrl])
 
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
-  }, [messages])
+  }, [messages, thinking])
 
   const stop = useCallback(() => {
     abortRef.current?.abort()
     abortRef.current = null
     setStreaming(false)
+    setThinking(false)
     setMessages((prev) =>
       prev.map((m) => (m.streaming ? { ...m, streaming: false, content: m.content + '\n\n_[stopped]_' } : m))
     )
@@ -600,25 +639,35 @@ function PlaygroundTab({ proxyUrl }: { proxyUrl?: string }) {
 
     const userMsg: Message = { id: crypto.randomUUID(), role: 'user', content }
     const assistantMsg: Message = { id: crypto.randomUUID(), role: 'assistant', content: '', streaming: true }
-    // Build messages array including prior context for the API
     const apiMessages = [...messages, userMsg].map((m) => ({ role: m.role, content: m.content }))
     setMessages((prev) => [...prev, userMsg, assistantMsg])
     setInput('')
     setStreaming(true)
+    setThinking(true)
 
     const ac = new AbortController()
     abortRef.current = ac
+
+    const thinkingFlag = thinkingMode === 'fast' ? false : true
+    const searchFlag = thinkingMode === 'auto'
 
     try {
       const res = await fetch(apiUrl('/chat/completions', proxyUrl), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages: apiMessages, stream: true }),
+        body: JSON.stringify({
+          model,
+          messages: apiMessages,
+          stream: true,
+          thinking: thinkingFlag,
+          search: searchFlag,
+        }),
         signal: ac.signal,
       })
 
       if (!res.ok || !res.body) {
         const errText = await res.text().catch(() => 'request failed')
+        setThinking(false)
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantMsg.id
@@ -633,6 +682,7 @@ function PlaygroundTab({ proxyUrl }: { proxyUrl?: string }) {
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
+      let firstChunk = true
 
       while (true) {
         const { done, value } = await reader.read()
@@ -645,6 +695,7 @@ function PlaygroundTab({ proxyUrl }: { proxyUrl?: string }) {
           if (!trimmed.startsWith('data:')) continue
           const payload = trimmed.slice(5).trim()
           if (payload === '[DONE]') {
+            setThinking(false)
             setMessages((prev) => prev.map((m) => (m.id === assistantMsg.id ? { ...m, streaming: false } : m)))
             continue
           }
@@ -652,6 +703,10 @@ function PlaygroundTab({ proxyUrl }: { proxyUrl?: string }) {
             const json = JSON.parse(payload)
             const delta = json.choices?.[0]?.delta?.content
             if (delta) {
+              if (firstChunk) {
+                setThinking(false)
+                firstChunk = false
+              }
               setMessages((prev) =>
                 prev.map((m) => (m.id === assistantMsg.id ? { ...m, content: m.content + delta } : m))
               )
@@ -659,9 +714,11 @@ function PlaygroundTab({ proxyUrl }: { proxyUrl?: string }) {
           } catch {}
         }
       }
+      setThinking(false)
       setMessages((prev) => prev.map((m) => (m.id === assistantMsg.id ? { ...m, streaming: false } : m)))
     } catch (e: any) {
       if (e.name === 'AbortError') return
+      setThinking(false)
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantMsg.id ? { ...m, streaming: false, error: true, content: `Error: ${e.message}` } : m
@@ -669,31 +726,63 @@ function PlaygroundTab({ proxyUrl }: { proxyUrl?: string }) {
       )
     } finally {
       setStreaming(false)
+      setThinking(false)
       abortRef.current = null
     }
-  }, [input, streaming, model, messages])
+  }, [input, streaming, model, messages, thinkingMode, proxyUrl])
 
   const clearChat = () => {
     if (streaming) return
     setMessages([])
-    // Also tell the proxy to start a new chat
     fetch(apiUrl('/chats/new', proxyUrl), { method: 'POST' }).catch(() => {})
   }
+
+  const modelOptions = models.length > 0
+    ? models
+    : [
+        { id: 'qwen3.7-plus', info: { name: 'Qwen3.7-Plus' } },
+        { id: 'qwen3.8-max', info: { name: 'Qwen3.8-Max' } },
+      ]
 
   return (
     <div className="flex flex-col h-[calc(100vh-220px)]">
       {/* Toolbar */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <div className="flex items-center gap-2">
           <Select value={model} onValueChange={setModel} disabled={streaming}>
-            <SelectTrigger className="w-[180px]">
+            <SelectTrigger className="w-[200px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="qwen3.7-plus">Qwen3.7-Plus</SelectItem>
-              <SelectItem value="qwen3.8-max">Qwen3.8-Max</SelectItem>
+              {modelOptions.map((m) => (
+                <SelectItem key={m.id} value={m.id}>
+                  <div className="flex flex-col">
+                    <span className="font-medium">{m.info?.name || m.id}</span>
+                    {m.info?.short_description && (
+                      <span className="text-xs text-zinc-500">{m.info.short_description.slice(0, 60)}</span>
+                    )}
+                  </div>
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
+
+          <div className="flex items-center bg-zinc-100 dark:bg-zinc-800 rounded-lg p-0.5">
+            {(['auto', 'thinking', 'fast'] as ThinkingMode[]).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => setThinkingMode(mode)}
+                disabled={streaming}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors capitalize ${
+                  thinkingMode === mode
+                    ? 'bg-white dark:bg-zinc-700 text-emerald-600 dark:text-emerald-400 shadow-sm'
+                    : 'text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200'
+                }`}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
         </div>
         {messages.length > 0 && !streaming && (
           <Button variant="ghost" size="sm" onClick={clearChat} className="gap-1.5 text-zinc-500">
@@ -711,11 +800,26 @@ function PlaygroundTab({ proxyUrl }: { proxyUrl?: string }) {
               <Terminal className="w-10 h-10 text-zinc-300 mx-auto mb-3" />
               <p className="text-sm text-zinc-500">Send a message to start chatting with Qwen.</p>
               <p className="text-xs text-zinc-400 mt-1">
-                Messages are sent through the proxy API — same flow as Cline.
+                Mode: <span className="text-emerald-500 font-medium capitalize">{thinkingMode}</span>
+                {' \u00b7 '}
+                Model: <span className="text-emerald-500 font-medium">{modelOptions.find(m => m.id === model)?.info?.name || model}</span>
               </p>
             </div>
           ) : (
             messages.map((m) => <MessageBubble key={m.id} message={m} />)
+          )}
+          {thinking && (
+            <div className="flex gap-3">
+              <div className="w-8 h-8 shrink-0 rounded-lg flex items-center justify-center bg-gradient-to-br from-emerald-500 to-teal-600 text-white text-xs font-semibold">
+                Q
+              </div>
+              <div className="rounded-2xl px-4 py-2.5 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800">
+                <div className="flex items-center gap-2 text-sm text-zinc-500">
+                  <Brain className="w-4 h-4 animate-pulse text-emerald-500" />
+                  Thinking…
+                </div>
+              </div>
+            </div>
           )}
         </div>
       </div>
