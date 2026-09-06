@@ -1,0 +1,5 @@
+.env
+.browser-data/
+__pycache__/
+*.pyc
+node_modules/

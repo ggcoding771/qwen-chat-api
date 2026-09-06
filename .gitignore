@@ -1,54 +1,69 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
 
-# dependencies
-node_modules
-/.pnp
-.pnp.*
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/versions
+# Next.js
+.next/
+out/
+build/
 
-# testing
-/coverage
+# Production
+dist/
 
-# next.js
-/.next/
-/out/
+# Environment files (NEVER commit secrets)
+.env
+.env.local
+.env.*.local
+*.env
 
-# production
-/build
+# Browser data
+.browser-data/
 
-# misc
+# Playwright
+storage-state.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
 .DS_Store
-*.pem
+Thumbs.db
 
-# debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
-
-# env files (can opt-in for committing if needed)
-.env*
-
-# vercel
-.vercel
-
-
-# typescript
-*.tsbuildinfo
-next-env.d.ts
-local-*
-.claude
-.z-ai-config
+# Logs
 *.log
 dev.log
-dev.out.log
-test
-prompt
-
 server.log
-# Skills directory
-/skills/
+proxy.log
+
+# Screenshots
+*.png
+
+# Tool results
+tool-results/
+
+# PID files
+*.pid
+
+# Database
+*.db
+*.sqlite
+
+# Upload/Download
+upload/
+download/
+
+# Skills (internal)
+skills/
+
+# Tests
+tests/

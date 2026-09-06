@@ -31,3 +31,35 @@ Stage Summary:
 - Demo UI: `/` (root)
 - Credentials stored as env vars in `mini-services/qwen-proxy/.env` (gitignored)
 - Note: rotate the Qwen account password after use
+
+---
+Task ID: 2-6
+Agent: main (Z.ai Code)
+Task: Add chat continuity, chat management, Python script, dashboard, and deploy to GitHub + Cloudflare Pages
+
+Work Log:
+- Added chat continuity to TS proxy: same first user message hash = continue same Qwen chat
+- Fixed response streaming to read LAST assistant message (not first) with thinking-phase detection (Skip button)
+- Added endpoints: /v1/chats, /v1/chats/select, /v1/chats/new, /v1/state, /v1/logs, /v1/analytics, /health
+- Added mode toggle tracking (thinking, search, deep_research) — Qwen Auto mode handles actual selection
+- Verified continuity: "My favorite number is 42" → "What is my favorite number?" → "42" ✓
+- Built Next.js catch-all API route /api/v1/[...path] that proxies to localhost:3030
+- Built full dashboard UI with 6 tabs: Setup, Chats, Playground, Logs, Analytics, Settings
+- Setup tab: credential input, API key generation, Cline setup instructions, base URL
+- Chats tab: list/select/new chat
+- Playground tab: streaming chat interface
+- Logs tab: live request history with expandable details
+- Analytics tab: token usage stat cards + hourly bar chart + by-model breakdown
+- Settings tab: mode toggle switches, session info, proxy health
+- Built standalone Python script (mini-services/qwen-python/) using playwright-python + FastAPI + rich
+  - Same chat continuity logic as TS proxy
+  - CLI dashboard with rich
+  - Port 3031 (different from TS proxy's 3030)
+  - Same OpenAI-compatible API endpoints
+- Fixed manage.sh to kill stale processes on port 3030 before starting
+
+Stage Summary:
+- Chat continuity: WORKING (same conversation continues, context preserved)
+- Dashboard: 6-tab interface on / with full feature set
+- Python script: standalone alternative at mini-services/qwen-python/
+- Ready for GitHub push + CF Pages deployment

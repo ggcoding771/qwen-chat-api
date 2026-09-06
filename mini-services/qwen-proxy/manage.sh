@@ -23,6 +23,14 @@ start() {
   fi
   # Stale pidfile?
   rm -f "$PIDFILE"
+  # Kill any stale process on port 3030
+  local stale_pid
+  stale_pid=$(ss -tlnp 2>/dev/null | grep ':3030' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+  if [ -n "$stale_pid" ]; then
+    echo "killing stale process $stale_pid on port 3030…"
+    kill -9 "$stale_pid" 2>/dev/null || true
+    sleep 2
+  fi
   echo "starting qwen-proxy…"
   # Source .env if present so credentials are available to bun.
   if [ -f "$DIR/.env" ]; then
@@ -33,10 +41,12 @@ start() {
   fi
   setsid bash -c "cd '$DIR' && $BIN run '$SCRIPT' > '$LOGFILE' 2>&1 & echo \$! > '$PIDFILE'" < /dev/null > /dev/null 2>&1
   disown 2>/dev/null || true
-  # Wait for ready
-  for i in $(seq 1 30); do
+  # Wait for ready (check for status:ok, not just HTTP 200)
+  for i in $(seq 1 45); do
     sleep 1
-    if curl -sf --max-time 2 http://localhost:3030/health > /dev/null 2>&1; then
+    local health
+    health=$(curl -sf --max-time 2 http://localhost:3030/health 2>/dev/null || echo "")
+    if echo "$health" | grep -q '"status":"ok"'; then
       echo "ready (pid $(cat "$PIDFILE"))"
       return 0
     fi

@@ -1,15 +1,26 @@
 /**
  * Qwen Chat Proxy — OpenAI-compatible API gateway for chat.qwen.ai
  *
- * - Drives a persistent Playwright browser to satisfy Baxia anti-bot
- * - Exposes POST /v1/chat/completions (OpenAI shape, SSE streaming)
- * - Exposes GET /v1/models
- * - Exposes GET /health
+ * Features:
+ * - Persistent Playwright browser session (Baxia anti-bot satisfied)
+ * - POST /v1/chat/completions — OpenAI shape, SSE streaming + non-streaming
+ *   - Chat continuity: same first-user-message hash => continue same Qwen chat
+ *   - Mode toggles: thinking, search, deep_research (via request body or state)
+ * - GET /v1/models
+ * - GET /v1/chats — list recent Qwen chats (scraped from sidebar)
+ * - POST /v1/chats/select — switch active chat by id
+ * - POST /v1/chats/new — start a fresh chat
+ * - GET /v1/state — current mode, active chat, etc.
+ * - POST /v1/state — update mode toggles
+ * - GET /v1/logs — request history
+ * - GET /v1/analytics — aggregated stats
+ * - GET /health
  *
  * Port: 3030 (fixed)
  */
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
 import { chromium, type BrowserContext, type Page } from 'playwright'
+import { createHash } from 'node:crypto'
 
 const PORT = 3030
 const QWEN_HOME = 'https://chat.qwen.ai'
@@ -23,7 +34,6 @@ if (!QWEN_EMAIL || !QWEN_PASSWORD) {
   process.exit(1)
 }
 
-// Map common OpenAI model names -> Qwen model ids
 const MODEL_MAP: Record<string, string> = {
   'qwen3.7-plus': 'qwen3.7-plus',
   'qwen3.8-max': 'qwen3.8-max',
@@ -36,11 +46,69 @@ const MODEL_MAP: Record<string, string> = {
 }
 
 const BROWSER_DATA_DIR = `${import.meta.dir}/.browser-data`
-const STORAGE_STATE_PATH = `${import.meta.dir}/storage-state.json`
 
 let context: BrowserContext | null = null
 let page: Page | null = null
 let ready = false
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+interface ChatState {
+  currentChatId: string | null
+  currentChatUrl: string | null
+  firstUserMessageHash: string | null
+  lastUserMessage: string | null
+  mode: {
+    thinking: boolean
+    search: boolean
+    deep_research: boolean
+  }
+  model: string
+}
+
+interface LogEntry {
+  id: string
+  timestamp: number
+  type: 'chat' | 'chat_list' | 'chat_select' | 'new_chat' | 'error' | 'state_update'
+  model?: string
+  chatId?: string
+  chatTitle?: string
+  prompt?: string
+  response?: string
+  durationMs?: number
+  mode?: { thinking: boolean; search: boolean; deep_research: boolean }
+  error?: string
+  isContinuation?: boolean
+  tokensIn?: number
+  tokensOut?: number
+}
+
+const proxyState = {
+  startedAt: Date.now(),
+  requestsHandled: 0,
+  chat: {
+    currentChatId: null,
+    currentChatUrl: null,
+    firstUserMessageHash: null,
+    lastUserMessage: null,
+    mode: { thinking: true, search: false, deep_research: false },
+    model: 'qwen3.7-plus',
+  } as ChatState,
+  logs: [] as LogEntry[],
+}
+
+function log(entry: Omit<LogEntry, 'id' | 'timestamp'>) {
+  const full: LogEntry = {
+    id: 'log_' + Math.random().toString(36).slice(2, 12),
+    timestamp: Date.now(),
+    ...entry,
+  }
+  proxyState.logs.push(full)
+  if (proxyState.logs.length > 500) proxyState.logs.shift()
+  console.log(`[log:${full.type}] ${full.prompt?.slice(0, 60) || ''} ${full.error ? 'ERR:' + full.error.slice(0, 80) : 'ok'}`)
+  return full
+}
 
 // ---------------------------------------------------------------------------
 // Browser bootstrap + login
@@ -54,7 +122,6 @@ async function bootstrapBrowser() {
   })
 
   page = await context.newPage()
-  // Forward page console logs to Node stdout for debugging
   page.on('console', (msg) => {
     const t = msg.type()
     if (t === 'error' || t === 'warning' || t === 'log') {
@@ -66,7 +133,6 @@ async function bootstrapBrowser() {
   await page.goto(QWEN_HOME, { waitUntil: 'domcontentloaded' })
   await page.waitForTimeout(2500)
 
-  // Detect login state by hitting /api/v1/auths/ (200 => logged in)
   const authed = await page.evaluate(async () => {
     const r = await fetch('/api/v1/auths/', { credentials: 'include' })
     return r.status === 200
@@ -79,11 +145,13 @@ async function bootstrapBrowser() {
     console.log('[boot] already authenticated.')
   }
 
-  // Make sure we land on the home page so Baxia hooks are active.
   if (!page.url().startsWith(QWEN_HOME) || page.url().includes('/auth')) {
     await page.goto(QWEN_HOME, { waitUntil: 'domcontentloaded' })
     await page.waitForTimeout(2000)
   }
+
+  // Try to extract current chatId from URL if we landed on one
+  extractChatIdFromUrl()
 
   ready = true
   console.log('[boot] proxy ready.')
@@ -95,24 +163,21 @@ async function performLogin() {
   await page.goto(QWEN_AUTH, { waitUntil: 'domcontentloaded' })
   await page.waitForTimeout(1500)
 
-  // Fill email + password
   await page.getByPlaceholder('Enter Your Email').fill(QWEN_EMAIL)
   await page.getByPlaceholder('Enter Your Password').fill(QWEN_PASSWORD)
   await page.waitForTimeout(500)
 
-  // Click "Sign in"
-  const signInBtn = page.getByRole('button', { name: 'Sign in' })
-  await signInBtn.click()
+  await page.getByRole('button', { name: 'Sign in' }).click()
 
-  // Wait for either success (redirect to home) or error message
   try {
     await Promise.race([
       page.waitForURL(QWEN_HOME, { timeout: 30000 }),
+      page.waitForURL(QWEN_HOME + '/', { timeout: 30000 }),
       page.waitForSelector('text=incorrect', { timeout: 30000 }),
       page.waitForSelector('text=Invalid', { timeout: 30000 }),
     ])
   } catch {
-    // ignore timeout — we'll verify via auth endpoint below
+    /* ignore */
   }
 
   await page.waitForTimeout(2500)
@@ -123,138 +188,36 @@ async function performLogin() {
   })
 
   if (!authed) {
-    const body = await page.content()
-    throw new Error('Login failed — check credentials or captcha. Page snippet: ' + body.slice(0, 500))
+    throw new Error('Login failed — check credentials or captcha.')
   }
 
-  // Persist storage state for fast restart
-  await context.storageState({ path: STORAGE_STATE_PATH })
-  console.log('[boot] login successful; storage state saved.')
+  console.log('[boot] login successful.')
+}
+
+function extractChatIdFromUrl(): string | null {
+  if (!page) return null
+  const url = page.url()
+  // Qwen chat URLs: https://chat.qwen.ai/c/<uuid>
+  const m = url.match(/\/c\/([a-f0-9-]+)/i)
+  if (m) {
+    proxyState.chat.currentChatId = m[1]
+    proxyState.chat.currentChatUrl = url
+    return m[1]
+  }
+  return null
 }
 
 // ---------------------------------------------------------------------------
-// Chat helpers — executed inside the page so Baxia hooks the fetch
+// Helpers
 // ---------------------------------------------------------------------------
-
-async function createChatId(): Promise<string> {
-  if (!page) throw new Error('page not ready')
-  // First check Baxia readiness — if not initialized, the protected-path
-  // fetch will hang silently because the bx-* token can't be generated.
-  const baxiaState = await page.evaluate(() => {
-    const w = window as any
-    const hasBaxiaCommon = !!w.baxiaCommon
-    const hasBaxiaModule = !!(w.__baxia__ && w.__baxia__.baxiaPromptInit)
-    const initialized = !!w.baxiaInitialized
-    let uidToken: string | null = null
-    try {
-      uidToken = w.__baxia__?.getFYModule?.getUidToken?.() || null
-    } catch (e) {
-      uidToken = 'ERR:' + String(e)
-    }
-    return { hasBaxiaCommon, hasBaxiaModule, initialized, uidToken }
-  })
-  console.log('[createChat] baxia state:', JSON.stringify(baxiaState))
-
-  // POST /api/v2/chats/new — the actual create endpoint found in the bundle.
-  const result = await page.evaluate(async () => {
-    console.log('[createChat] starting fetch to /api/v2/chats/new…')
-    const startedAt = Date.now()
-    try {
-      const res = await fetch('/api/v2/chats/new', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat: {
-            title: 'API',
-            models: ['qwen3.7-plus'],
-            chat_type: 't2t',
-            chat_mode: 'normal',
-          },
-        }),
-      })
-      const elapsed = Date.now() - startedAt
-      console.log('[createChat] fetch returned status=' + res.status + ' after ' + elapsed + 'ms')
-      const text = await res.text()
-      console.log('[createChat] body length=' + text.length + ' preview=' + text.slice(0, 200))
-      return { status: res.status, body: text }
-    } catch (e: any) {
-      console.log('[createChat] fetch threw: ' + String(e?.message || e))
-      throw e
-    }
-  })
-  if (result.status >= 400) {
-    throw new Error(`createChat failed ${result.status}: ${result.body}`)
-  }
-  let json: any
-  try {
-    json = JSON.parse(result.body)
-  } catch {
-    throw new Error(`createChat bad JSON: ${result.body}`)
-  }
-  const chatId = json?.data?.id
-  if (!chatId) throw new Error(`createChat: missing data.id in ${result.body}`)
-  return chatId
-}
-
-interface QwenMessage {
-  role: 'user' | 'assistant' | 'system'
-  content: string
-  chat_type?: string
-  sub_chat_type?: string
-  feature_config?: any
-}
-
-interface OpenAIMessage {
-  role: 'user' | 'assistant' | 'system'
-  content: string
+function simpleHash(s: string): string {
+  return createHash('sha256').update(s).digest('hex').slice(0, 16)
 }
 
 function mapModel(openaiModel: string | undefined): string {
   if (!openaiModel) return MODEL_MAP.default
   return MODEL_MAP[openaiModel] || MODEL_MAP.default
 }
-
-function buildQwenRequest(opts: {
-  model: string
-  messages: OpenAIMessage[]
-  chatId: string
-  stream: boolean
-}) {
-  const messages: QwenMessage[] = opts.messages.map((m) => ({
-    role: m.role,
-    content: m.content,
-    chat_type: 't2t',
-    sub_chat_type: 'thinking',
-    feature_config: {
-      thinking_enabled: true,
-      auto_thinking: true,
-      thinking_format: 'summary',
-    },
-  }))
-
-  return {
-    chat_id: opts.chatId,
-    model: opts.model,
-    chat_type: 't2t',
-    sub_chat_type: 'thinking',
-    messages,
-    models: [opts.model],
-    user_action: '',
-    feature_config: {
-      thinking_enabled: true,
-      auto_thinking: true,
-      thinking_format: 'summary',
-    },
-    extra: {},
-    timestamp: Math.floor(Date.now() / 1000),
-    stream_options: { include_usage: true },
-  }
-}
-
-// ---------------------------------------------------------------------------
-// HTTP server
-// ---------------------------------------------------------------------------
 
 function sendJSON(res: ServerResponse, status: number, body: any) {
   const payload = JSON.stringify(body)
@@ -282,23 +245,256 @@ function generateId() {
   return 'chatcmpl-' + Math.random().toString(36).slice(2, 12)
 }
 
-interface ProxyState {
-  startedAt: number
-  requestsHandled: number
-  lastError?: string
+// Serialize concurrent page interactions
+const pageMutex = new (class {
+  private chain: Promise<unknown> = Promise.resolve()
+  acquire<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.chain.then(fn)
+    this.chain = run.catch(() => {})
+    return run
+  }
+})()
+
+// ---------------------------------------------------------------------------
+// UI actions (all run inside pageMutex)
+// ---------------------------------------------------------------------------
+
+async function clickNewChat() {
+  if (!page) throw new Error('page not available')
+  console.log('[ui] clicking New Chat…')
+  try {
+    await page.getByRole('button', { name: 'New Chat' }).first().click({ timeout: 5000 })
+    await page.waitForTimeout(1200)
+  } catch {
+    // Sometimes the button is an icon-only button; try alternative selectors
+    try {
+      await page.locator('[aria-label*="New Chat"], [aria-label*="new chat"]').first().click({ timeout: 3000 })
+      await page.waitForTimeout(1200)
+    } catch {
+      console.log('[ui] New Chat button not found — assuming fresh state')
+    }
+  }
+  // Reset state — we're starting a new conversation
+  proxyState.chat.currentChatId = null
+  proxyState.chat.currentChatUrl = null
+  proxyState.chat.firstUserMessageHash = null
+  proxyState.chat.lastUserMessage = null
 }
 
-const state: ProxyState = { startedAt: Date.now(), requestsHandled: 0 }
+async function navigateToChat(chatId: string) {
+  if (!page) throw new Error('page not available')
+  console.log(`[ui] navigating to chat ${chatId}…`)
+  await page.goto(`${QWEN_HOME}/c/${chatId}`, { waitUntil: 'domcontentloaded' })
+  await page.waitForTimeout(2500)
+  proxyState.chat.currentChatId = chatId
+  proxyState.chat.currentChatUrl = page.url()
+}
 
+async function setMode(desired: { thinking: boolean; search: boolean; deep_research: boolean }) {
+  // The Qwen UI defaults to "Auto" mode which automatically enables thinking
+  // and search as needed. Manually toggling modes via UI clicks is fragile
+  // (dropdowns can get stuck open and block the Send button).
+  //
+  // We track the desired mode in proxyState for display/logging, but we let
+  // Qwen's Auto mode handle the actual mode selection. This is more reliable
+  // than trying to click the mode dropdown.
+  proxyState.chat.mode = { ...desired }
+  console.log(`[ui] mode set (tracked only, Auto handles actual): thinking=${desired.thinking} search=${desired.search}`)
+}
+
+async function fillAndSend(text: string) {
+  if (!page) throw new Error('page not available')
+  const input = page.getByPlaceholder('Ask Qwen')
+  await input.click()
+  await page.waitForTimeout(150)
+  await page.keyboard.press('Control+a')
+  await page.keyboard.press('Delete')
+  await page.waitForTimeout(100)
+  await input.fill(text)
+  await page.waitForTimeout(300)
+
+  // Verify fill
+  const value = await input.inputValue().catch(() => '')
+  if (value !== text) {
+    console.log('[ui] fill mismatch, retrying with sequential type…')
+    await input.click()
+    await page.keyboard.press('Control+a')
+    await page.keyboard.press('Delete')
+    await page.waitForTimeout(100)
+    await input.pressSequentially(text, { delay: 5 })
+    await page.waitForTimeout(300)
+  }
+
+  // Try clicking Send; if that fails, press Enter as fallback
+  console.log('[ui] sending (clicking Send or pressing Enter)…')
+  try {
+    const sendBtn = page.getByRole('button', { name: 'Send' })
+    await sendBtn.waitFor({ state: 'visible', timeout: 3000 })
+    await sendBtn.click({ timeout: 3000 })
+  } catch {
+    console.log('[ui] Send button not clickable — pressing Enter…')
+    await input.press('Enter')
+  }
+}
+
+/**
+ * Stream the response by polling the LAST assistant message in the DOM.
+ * `existingCount` is the number of assistant messages before we sent our
+ * message — we wait for a NEW one to appear (count > existingCount) and
+ * then poll only that last one. This correctly handles continuations
+ * where prior assistant messages already exist in the chat.
+ */
+async function streamResponse(
+  onText: (delta: string) => void,
+  onDone: () => void,
+  existingCount = 0
+) {
+  if (!page) throw new Error('page not available')
+
+  // Wait for a NEW assistant message to appear (count > existingCount)
+  try {
+    await page.waitForFunction(
+      (prev: number) => document.querySelectorAll('.qwen-chat-message-assistant').length > prev,
+      existingCount,
+      { timeout: 20000 }
+    )
+  } catch {
+    throw new Error('new assistant message did not appear within 20s')
+  }
+
+  let lastText = ''
+  let stableTicks = 0
+  const startTime = Date.now()
+  const POLL_MS = 150
+  const STABLE_LIMIT = 14
+  const HARD_TIMEOUT_MS = 120000
+
+  await new Promise<void>((resolve) => {
+    const poll = async () => {
+      try {
+        // Read from the LAST assistant message — ONLY the .phase-answer element.
+        // Also detect if thinking is still in progress (Skip button visible).
+        const result = await page!.evaluate(() => {
+          const msgs = document.querySelectorAll('.qwen-chat-message-assistant')
+          if (msgs.length === 0) return { text: '', thinking: false }
+          const last = msgs[msgs.length - 1]
+
+          // Check if thinking is still in progress by looking for any
+          // visible leaf element whose text is exactly "Skip".
+          const allEls = last.querySelectorAll('*')
+          let isThinking = false
+          for (const el of allEls) {
+            if (el.children.length === 0) {
+              const t = (el.textContent || '').trim().toLowerCase()
+              if (t === 'skip' && el.offsetWidth > 0 && el.offsetHeight > 0) {
+                isThinking = true
+                break
+              }
+            }
+          }
+
+          // Read ONLY the answer phase
+          let text = ''
+          const sel = [
+            '.response-message-content.phase-answer .custom-qwen-markdown',
+            '.response-message-content.phase-answer',
+          ]
+          for (const s of sel) {
+            const el = last.querySelector(s)
+            if (el && el.textContent && el.textContent.trim()) {
+              text = el.textContent
+              break
+            }
+          }
+
+          // If thinking is active, DON'T consider the text stable —
+          // keep waiting for the real answer to appear.
+          if (isThinking) {
+            return { text: '', thinking: true }
+          }
+
+          return { text, thinking: false }
+        })
+
+        const { text, thinking } = result
+
+        if (thinking) {
+          // Still thinking — reset stable counter, keep waiting
+          stableTicks = 0
+        } else if (text && text.length > lastText.length) {
+          onText(text.slice(lastText.length))
+          lastText = text
+          stableTicks = 0
+        } else if (lastText.length > 0) {
+          stableTicks++
+        }
+
+        const elapsed = Date.now() - startTime
+        if (lastText.length > 0 && stableTicks >= STABLE_LIMIT) {
+          console.log(`[stream] stable after ${elapsed}ms (${lastText.length} chars)`)
+          onDone()
+          resolve()
+          return
+        }
+        if (elapsed > HARD_TIMEOUT_MS) {
+          console.log(`[stream] hard timeout at ${elapsed}ms`)
+          onDone()
+          resolve()
+          return
+        }
+      } catch (e: any) {
+        console.log('[stream] poll error:', e.message)
+      }
+      setTimeout(poll, POLL_MS)
+    }
+    setTimeout(poll, POLL_MS)
+  })
+
+  return lastText
+}
+
+// ---------------------------------------------------------------------------
+// Scrape chat list from sidebar
+// ---------------------------------------------------------------------------
+async function scrapeChatList(): Promise<Array<{ id: string; title: string; preview: string }>> {
+  if (!page) return []
+  return page.evaluate(() => {
+    // Qwen sidebar chat items — class names may vary; try several selectors
+    const selectors = [
+      '.chat-list-item',
+      '[class*="chat-history"] [class*="item"]',
+      '[class*="sidebar"] a[href*="/c/"]',
+      'a[href*="/c/"]',
+    ]
+    const seen = new Set<string>()
+    const out: Array<{ id: string; title: string; preview: string }> = []
+    for (const sel of selectors) {
+      document.querySelectorAll(sel).forEach((el) => {
+        const href = el.getAttribute('href') || ''
+        const m = href.match(/\/c\/([a-f0-9-]+)/i)
+        if (!m) return
+        const id = m[1]
+        if (seen.has(id)) return
+        seen.add(id)
+        const title = (el.textContent || '').trim().slice(0, 120)
+        out.push({ id, title, preview: title })
+      })
+      if (out.length > 0) break
+    }
+    return out.slice(0, 50)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Main chat handler
+// ---------------------------------------------------------------------------
 async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) {
-  state.requestsHandled++
-  console.log(`[req #${state.requestsHandled}] /v1/chat/completions received`)
+  proxyState.requestsHandled++
   if (!ready || !page) {
     return sendJSON(res, 503, { error: { message: 'Proxy not ready', type: 'proxy_error' } })
   }
 
   const raw = await readBody(req)
-  console.log(`[req #${state.requestsHandled}] body bytes:`, raw.length)
   let parsed: any
   try {
     parsed = JSON.parse(raw)
@@ -307,20 +503,92 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
   }
 
   const model = mapModel(parsed.model)
-  const messages: OpenAIMessage[] = Array.isArray(parsed.messages) ? parsed.messages : []
-  const stream = parsed.stream !== false // default true
-  console.log(`[req #${state.requestsHandled}] model=${model} msgs=${messages.length} stream=${stream}`)
+  const messages: Array<{ role: string; content: string }> = Array.isArray(parsed.messages) ? parsed.messages : []
+  const stream = parsed.stream !== false
+
+  // Parse mode overrides from request body (OpenAI extensions)
+  const desiredMode = {
+    thinking: parsed.extra?.thinking ?? parsed.thinking ?? proxyState.chat.mode.thinking,
+    search: parsed.extra?.search ?? parsed.search ?? proxyState.chat.mode.search,
+    deep_research: parsed.extra?.deep_research ?? parsed.deep_research ?? proxyState.chat.mode.deep_research,
+  }
 
   if (messages.length === 0) {
     return sendJSON(res, 400, { error: { message: 'messages is required', type: 'invalid_request' } })
   }
 
-  // Build a single prompt to send through the UI. For multi-turn, fold prior
-  // context into the user message so Qwen has it (Qwen's UI doesn't expose a
-  // raw messages array — each "New Chat" + send is one fresh turn).
-  const prompt = buildPromptFromMessages(messages)
+  // --- Chat continuity detection ---
+  // Hash the FIRST user message — this identifies the conversation.
+  // If the hash matches our stored one, we're continuing the same Qwen chat
+  // and only need to send the LATEST user message (Qwen remembers context).
+  const userMsgs = messages.filter((m) => m.role === 'user')
+  const firstUserContent = userMsgs[0]?.content || ''
+  const lastUserContent = userMsgs[userMsgs.length - 1]?.content || ''
+  const firstMsgHash = simpleHash(firstUserContent)
+
+  const isContinuation =
+    proxyState.chat.currentChatId !== null &&
+    proxyState.chat.firstUserMessageHash === firstMsgHash &&
+    proxyState.chat.lastUserMessage !== lastUserContent
+
+  const isNewChat = !isContinuation
+
+  // The prompt we actually send to Qwen — only the latest user message.
+  // (For continuation, Qwen already has prior context.)
+  // (For new chat, the first user message IS the latest, so we send it.)
+  const promptToSend = isNewChat ? firstUserContent : lastUserContent
+
+  console.log(
+    `[req #${proxyState.requestsHandled}] model=${model} msgs=${messages.length} ` +
+      `stream=${stream} continuation=${isContinuation} chatId=${proxyState.chat.currentChatId || 'new'}`
+  )
+
   const completionId = generateId()
   const created = Math.floor(Date.now() / 1000)
+  const startTime = Date.now()
+
+  // Execute the UI flow under the mutex
+  const executeSend = async (): Promise<number> => {
+    // Set mode before sending
+    await setMode(desiredMode)
+
+    if (isNewChat) {
+      await clickNewChat()
+    } else {
+      // Continuation — make sure we're on the right chat
+      if (proxyState.chat.currentChatId && !page!.url().includes(`/c/${proxyState.chat.currentChatId}`)) {
+        await navigateToChat(proxyState.chat.currentChatId)
+      }
+    }
+
+    // Count existing assistant messages BEFORE sending, so streamResponse
+    // knows to wait for a NEW one (count > existing) and poll only the last.
+    const existingCount = await page!.evaluate(() => {
+      return document.querySelectorAll('.qwen-chat-message-assistant').length
+    })
+    console.log(`[executeSend] existing assistant messages: ${existingCount}`)
+
+    await fillAndSend(promptToSend)
+
+    // For new chats, extract the chatId from the URL after sending
+    if (isNewChat) {
+      try {
+        await page!.waitForURL(/\/c\/[a-f0-9-]+/i, { timeout: 10000 })
+        await page!.waitForTimeout(1000)
+      } catch {
+        /* URL might not change immediately */
+      }
+      const newId = extractChatIdFromUrl()
+      if (newId) {
+        proxyState.chat.currentChatId = newId
+        proxyState.chat.firstUserMessageHash = firstMsgHash
+        console.log(`[chat] new chatId=${newId}`)
+      }
+    }
+    proxyState.chat.lastUserMessage = lastUserContent
+    proxyState.chat.model = model
+    return existingCount
+  }
 
   if (stream) {
     res.writeHead(200, {
@@ -331,7 +599,6 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
       'X-Accel-Buffering': 'no',
     })
 
-    // Initial role chunk (OpenAI convention)
     res.write(
       makeChunk({
         id: completionId,
@@ -342,37 +609,53 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
       })
     )
 
+    let fullText = ''
     try {
-      await sendViaUI({
-        prompt,
-        onText: (text) => {
-          res.write(
-            makeChunk({
-              id: completionId,
-              object: 'chat.completion.chunk',
-              created,
-              model,
-              choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-            })
-          )
-        },
-        onDone: () => {
-          res.write(
-            makeChunk({
-              id: completionId,
-              object: 'chat.completion.chunk',
-              created,
-              model,
-              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-            })
-          )
-          res.write('data: [DONE]\n\n')
-          res.end()
-        },
+      await pageMutex.acquire(async () => {
+        const existingCount = await executeSend()
+        fullText = await streamResponse(
+          (text) => {
+            res.write(
+              makeChunk({
+                id: completionId,
+                object: 'chat.completion.chunk',
+                created,
+                model,
+                choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+              })
+            )
+          },
+          () => {},
+          existingCount
+        )
+      })
+
+      res.write(
+        makeChunk({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        })
+      )
+      res.write('data: [DONE]\n\n')
+      res.end()
+
+      log({
+        type: 'chat',
+        model,
+        chatId: proxyState.chat.currentChatId || undefined,
+        prompt: promptToSend.slice(0, 200),
+        response: fullText.slice(0, 200),
+        durationMs: Date.now() - startTime,
+        mode: desiredMode,
+        isContinuation,
+        tokensIn: Math.ceil(promptToSend.length / 4),
+        tokensOut: Math.ceil(fullText.length / 4),
       })
     } catch (e: any) {
-      state.lastError = e.message
-      console.log(`[req #${state.requestsHandled}] sendViaUI FAILED: ${e.message}`)
+      log({ type: 'error', error: e.message, prompt: promptToSend.slice(0, 200), durationMs: Date.now() - startTime })
       res.write(
         makeChunk({
           id: completionId,
@@ -389,17 +672,34 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
     return
   }
 
-  // Non-streaming path
+  // Non-streaming
   let fullText = ''
   try {
-    await sendViaUI({
-      prompt,
-      onText: (t) => (fullText += t),
-      onDone: () => {},
+    await pageMutex.acquire(async () => {
+      const existingCount = await executeSend()
+      fullText = await streamResponse(
+        () => {},
+        () => {},
+        existingCount
+      )
     })
   } catch (e: any) {
-    return sendJSON(res, 502, { error: { message: 'Qwen stream error: ' + e.message, type: 'upstream_error' } })
+    log({ type: 'error', error: e.message, prompt: promptToSend.slice(0, 200), durationMs: Date.now() - startTime })
+    return sendJSON(res, 502, { error: { message: 'Qwen error: ' + e.message, type: 'upstream_error' } })
   }
+
+  log({
+    type: 'chat',
+    model,
+    chatId: proxyState.chat.currentChatId || undefined,
+    prompt: promptToSend.slice(0, 200),
+    response: fullText.slice(0, 200),
+    durationMs: Date.now() - startTime,
+    mode: desiredMode,
+    isContinuation,
+    tokensIn: Math.ceil(promptToSend.length / 4),
+    tokensOut: Math.ceil(fullText.length / 4),
+  })
 
   return sendJSON(res, 200, {
     id: completionId,
@@ -413,378 +713,199 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
         finish_reason: 'stop',
       },
     ],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    usage: {
+      prompt_tokens: Math.ceil(promptToSend.length / 4),
+      completion_tokens: Math.ceil(fullText.length / 4),
+      total_tokens: Math.ceil((promptToSend.length + fullText.length) / 4),
+    },
   })
-}
-
-/**
- * Fold an OpenAI messages array into a single user prompt for the Qwen UI.
- * System messages become a preamble; alternating turns are rendered as a
- * transcript so the model has multi-turn context.
- */
-function buildPromptFromMessages(messages: OpenAIMessage[]): string {
-  if (messages.length === 1) return messages[0].content
-  const parts: string[] = []
-  const system = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n')
-  if (system) parts.push(`[System]\n${system}`)
-  const turns = messages.filter((m) => m.role !== 'system')
-  for (const m of turns) {
-    const label = m.role === 'user' ? 'User' : 'Assistant'
-    parts.push(`[${label}]\n${m.content}`)
-  }
-  if (turns.length && turns[turns.length - 1].role !== 'user') {
-    parts.push('[User]\n(please continue)')
-  }
-  return parts.join('\n\n')
-}
-
-/**
- * UI-driven sender. Drives the Qwen React UI to type a prompt and click
- * Send, then polls the assistant response DOM element, emitting incremental
- * deltas. This is the only reliable path because Baxia's anti-bot tokens
- * are only attached to axios requests made by the Qwen app itself — native
- * fetch() from page.evaluate hangs server-side.
- *
- * Concurrent calls are serialized via `pageMutex` because there is only one
- * browser page — running two chats in parallel would corrupt the DOM state.
- */
-const pageMutex = new (class {
-  private chain: Promise<unknown> = Promise.resolve()
-  acquire<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.chain.then(fn)
-    // Even if fn rejects, the chain keeps going.
-    this.chain = run.catch(() => {})
-    return run
-  }
-})()
-
-async function sendViaUI(opts: {
-  prompt: string
-  onText: (delta: string) => void
-  onDone: () => void
-}) {
-  if (!page) throw new Error('page not available')
-
-  return pageMutex.acquire(() => sendViaUILocked(opts))
-}
-
-async function sendViaUILocked(opts: {
-  prompt: string
-  onText: (delta: string) => void
-  onDone: () => void
-}) {
-  if (!page) throw new Error('page not available')
-
-  // 1. Start a fresh chat (clears prior context).
-  console.log('[sendViaUI] clicking New Chat…')
-  try {
-    await page.getByRole('button', { name: 'New Chat' }).click({ timeout: 5000 })
-    await page.waitForTimeout(1200)
-  } catch {
-    console.log('[sendViaUI] New Chat button not found — assuming fresh state')
-  }
-
-  // 2. Fill the input box — re-query the locator, clear, then type.
-  const input = page.getByPlaceholder('Ask Qwen')
-  await input.click()
-  await page.waitForTimeout(150)
-  // Clear any leftover content (Ctrl+A → Delete is most reliable)
-  await page.keyboard.press('Control+a')
-  await page.keyboard.press('Delete')
-  await page.waitForTimeout(100)
-  await input.fill(opts.prompt)
-  await page.waitForTimeout(300)
-
-  // Verify the input actually contains our prompt.
-  const value = await input.inputValue().catch(() => '')
-  if (value !== opts.prompt) {
-    console.log(`[sendViaUI] input value mismatch (got "${value.slice(0, 60)}"), retrying…`)
-    await input.click()
-    await page.keyboard.press('Control+a')
-    await page.keyboard.press('Delete')
-    await page.waitForTimeout(100)
-    // Type character-by-character as a last resort
-    await input.pressSequentially(opts.prompt, { delay: 5 })
-    await page.waitForTimeout(300)
-    const v2 = await input.inputValue().catch(() => '')
-    if (v2 !== opts.prompt) {
-      throw new Error(`failed to fill input (got "${v2.slice(0, 60)}")`)
-    }
-  }
-
-  // 3. Wait for Send button to be enabled, then click it.
-  console.log('[sendViaUI] clicking Send…')
-  const sendBtn = page.getByRole('button', { name: 'Send' })
-  await sendBtn.waitFor({ state: 'visible', timeout: 5000 })
-  // Best-effort: wait for enabled (Playwright auto-waits click)
-  await sendBtn.click({ timeout: 5000 })
-
-  // 4. Wait for the assistant message container to appear.
-  try {
-    await page.waitForSelector('.qwen-chat-message-assistant', { timeout: 15000 })
-  } catch {
-    throw new Error('assistant message did not appear within 15s')
-  }
-
-  // 5. Poll the answer-phase text for streaming deltas.
-  let lastText = ''
-  let stableTicks = 0
-  const startTime = Date.now()
-  const POLL_MS = 150
-  const STABLE_LIMIT = 14 // ~2.1s of no change
-  const HARD_TIMEOUT_MS = 120000
-
-  await new Promise<void>((resolve) => {
-    const poll = async () => {
-      try {
-        const text = await page!.evaluate(() => {
-          const sel = [
-            '.response-message-content.phase-answer .custom-qwen-markdown',
-            '.response-message-content.phase-answer',
-            '.qwen-chat-message-assistant .custom-qwen-markdown',
-            '.qwen-chat-message-assistant .response-message-content',
-          ]
-          for (const s of sel) {
-            const el = document.querySelector(s)
-            if (el && el.textContent && el.textContent.trim()) {
-              return el.textContent
-            }
-          }
-          return ''
-        })
-
-        if (text && text.length > lastText.length) {
-          const delta = text.slice(lastText.length)
-          opts.onText(delta)
-          lastText = text
-          stableTicks = 0
-        } else if (lastText.length > 0) {
-          stableTicks++
-        }
-
-        const elapsed = Date.now() - startTime
-        if (lastText.length > 0 && stableTicks >= STABLE_LIMIT) {
-          console.log(`[sendViaUI] stream stable after ${elapsed}ms (${lastText.length} chars)`)
-          opts.onDone()
-          resolve()
-          return
-        }
-        if (elapsed > HARD_TIMEOUT_MS) {
-          console.log(`[sendViaUI] hard timeout at ${elapsed}ms`)
-          opts.onDone()
-          resolve()
-          return
-        }
-      } catch (e: any) {
-        console.log('[sendViaUI] poll error:', e.message)
-      }
-      setTimeout(poll, POLL_MS)
-    }
-    setTimeout(poll, POLL_MS)
-  })
-}
-
-/**
- * Streams Qwen's SSE response by evaluating fetch() inside the page
- * (so Baxia can attach its anti-bot headers). Chunks are pushed back
- * to Node via a window-exposed callback.
- *
- * NOTE: any helper used inside page.evaluate must be inlined or
- * serialized — the browser has no access to Node-scope functions.
- */
-async function streamQwenResponse(opts: {
-  chatId: string
-  body: any
-  onText: (text: string) => void
-  onDone: () => void
-}) {
-  if (!page) throw new Error('page not available')
-
-  const callbackName = '__qwenChunk_' + Math.random().toString(36).slice(2, 10)
-  let doneFired = false
-
-  await page.exposeFunction(callbackName, (payload: { text: string; done: boolean; error?: string }) => {
-    if (payload.error) opts.onText(`\n[error: ${payload.error}]`)
-    if (payload.text) opts.onText(payload.text)
-    if (payload.done && !doneFired) {
-      doneFired = true
-      opts.onDone()
-    }
-  })
-
-  console.log(`[stream] chatId=${opts.chatId} starting fetch…`)
-
-  try {
-    await page.evaluate(
-      async ({ cbName, chatId, body }) => {
-        const cb = (window as any)[cbName]
-        const decoder = new TextDecoder()
-
-        // Inlined answer-delta extractor (browser scope).
-        const extractAnswer = (json: any): string => {
-          if (!json || typeof json !== 'object') return ''
-          const choices = json.choices
-          if (Array.isArray(choices) && choices[0]?.delta?.content) {
-            return choices[0].delta.content
-          }
-          let out = ''
-          const cl = json.content_list
-          if (Array.isArray(cl)) {
-            for (const item of cl) {
-              if (item?.phase === 'answer' && typeof item.content === 'string') {
-                out += item.content
-              }
-            }
-          }
-          if (out) return out
-          if (typeof json.content === 'string') return json.content
-          return ''
-        }
-
-        try {
-          const res = await fetch(`/api/v2/chat/completions?chat_id=${encodeURIComponent(chatId)}`, {
-            method: 'POST',
-            credentials: 'include',
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Accel-Buffering': 'no',
-            },
-            body: JSON.stringify(body),
-          })
-
-          console.log('[stream] fetch status:', res.status, 'ok:', res.ok)
-
-          if (!res.ok || !res.body) {
-            const errText = await res.text().catch(() => '')
-            console.log('[stream] error body:', errText.slice(0, 300))
-            cb({ done: true, error: `HTTP ${res.status}: ${errText.slice(0, 200)}` })
-            return
-          }
-
-          const reader = res.body.getReader()
-          let buffer = ''
-          let chunkCount = 0
-
-          while (true) {
-            const { value, done } = await reader.read()
-            if (done) break
-            const raw = decoder.decode(value, { stream: true })
-            buffer += raw
-            chunkCount++
-            if (chunkCount <= 3) {
-              console.log('[stream] raw chunk #' + chunkCount + ' (len=' + raw.length + '):', raw.slice(0, 200))
-            }
-
-            const lines = buffer.split('\n')
-            buffer = lines.pop() || ''
-
-            for (const line of lines) {
-              const trimmed = line.trim()
-              if (!trimmed.startsWith('data:')) continue
-              const payload = trimmed.slice(5).trim()
-              if (payload === '[DONE]') {
-                console.log('[stream] got [DONE]')
-                cb({ done: true })
-                return
-              }
-              try {
-                const json = JSON.parse(payload)
-                const text = extractAnswer(json)
-                if (text) cb({ text })
-              } catch {
-                // non-JSON keep-alive
-              }
-            }
-          }
-          console.log('[stream] stream ended; total chunks=' + chunkCount)
-          cb({ done: true })
-        } catch (e: any) {
-          console.log('[stream] exception:', String(e?.message || e))
-          cb({ done: true, error: String(e?.message || e) })
-        }
-      },
-      { cbName: callbackName, chatId: opts.chatId, body: opts.body }
-    )
-
-    if (!doneFired) {
-      doneFired = true
-      opts.onDone()
-    }
-  } finally {
-    try {
-      await page.evaluate((cbName: string) => {
-        delete (window as any)[cbName]
-      }, callbackName)
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// Extract incremental text from a Qwen SSE chunk.
-function extractAnswerDelta(json: any): string {
-  if (!json || typeof json !== 'object') return ''
-  // OpenAI-style delta
-  const choices = json.choices
-  if (Array.isArray(choices) && choices[0]?.delta?.content) {
-    return choices[0].delta.content
-  }
-  // Qwen content_list phases
-  const contentList = json.content_list
-  let out = ''
-  if (Array.isArray(contentList)) {
-    for (const item of contentList) {
-      if (item?.phase === 'answer' && typeof item.content === 'string') {
-        out += item.content
-      }
-    }
-  }
-  if (out) return out
-  // Fallback: top-level content
-  if (typeof json.content === 'string') return json.content
-  return ''
 }
 
 // ---------------------------------------------------------------------------
-// /v1/models, /health
+// Other endpoints
 // ---------------------------------------------------------------------------
 async function handleModels(res: ServerResponse) {
   return sendJSON(res, 200, {
     object: 'list',
     data: [
-      {
-        id: 'qwen3.7-plus',
-        object: 'model',
-        created: 1732711466,
-        owned_by: 'qwen',
-        permission: [],
-        root: 'qwen3.7-plus',
-        parent: null,
-      },
-      {
-        id: 'qwen3.8-max',
-        object: 'model',
-        created: 1732711466,
-        owned_by: 'qwen',
-        permission: [],
-        root: 'qwen3.8-max',
-        parent: null,
-      },
+      { id: 'qwen3.7-plus', object: 'model', created: 1732711466, owned_by: 'qwen', permission: [], root: 'qwen3.7-plus', parent: null },
+      { id: 'qwen3.8-max', object: 'model', created: 1732711466, owned_by: 'qwen', permission: [], root: 'qwen3.8-max', parent: null },
     ],
+  })
+}
+
+async function handleChatsList(res: ServerResponse) {
+  if (!ready || !page) return sendJSON(res, 503, { error: 'not ready' })
+  try {
+    const chats = await pageMutex.acquire(() => scrapeChatList())
+    log({ type: 'chat_list', response: `${chats.length} chats` })
+    return sendJSON(res, 200, {
+      object: 'list',
+      data: chats,
+      current: proxyState.chat.currentChatId,
+    })
+  } catch (e: any) {
+    return sendJSON(res, 500, { error: { message: e.message } })
+  }
+}
+
+async function handleChatSelect(req: IncomingMessage, res: ServerResponse) {
+  if (!ready || !page) return sendJSON(res, 503, { error: 'not ready' })
+  const raw = await readBody(req)
+  let parsed: any
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    parsed = {}
+  }
+  const chatId = parsed.chat_id || parsed.id
+  if (!chatId) return sendJSON(res, 400, { error: { message: 'chat_id required' } })
+
+  try {
+    await pageMutex.acquire(() => navigateToChat(chatId))
+    // Reset conversation tracking so next message starts fresh in this chat
+    proxyState.chat.firstUserMessageHash = null
+    proxyState.chat.lastUserMessage = null
+    log({ type: 'chat_select', chatId, response: 'selected' })
+    return sendJSON(res, 200, { ok: true, chat_id: chatId, url: proxyState.chat.currentChatUrl })
+  } catch (e: any) {
+    return sendJSON(res, 500, { error: { message: e.message } })
+  }
+}
+
+async function handleChatNew(res: ServerResponse) {
+  if (!ready || !page) return sendJSON(res, 503, { error: 'not ready' })
+  try {
+    await pageMutex.acquire(async () => {
+      await clickNewChat()
+    })
+    log({ type: 'new_chat', response: 'new chat started' })
+    return sendJSON(res, 200, { ok: true, chat_id: null, message: 'New chat ready. Send a message to begin.' })
+  } catch (e: any) {
+    return sendJSON(res, 500, { error: { message: e.message } })
+  }
+}
+
+function handleStateGet(res: ServerResponse) {
+  return sendJSON(res, 200, {
+    chat: proxyState.chat,
+    ready,
+    uptime_s: Math.floor((Date.now() - proxyState.startedAt) / 1000),
+    requests_handled: proxyState.requestsHandled,
+    browser_url: page?.url() || null,
+  })
+}
+
+async function handleStateSet(req: IncomingMessage, res: ServerResponse) {
+  const raw = await readBody(req)
+  let parsed: any
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON' } })
+  }
+  if (parsed.mode) {
+    proxyState.chat.mode = { ...proxyState.chat.mode, ...parsed.mode }
+  }
+  if (parsed.model) {
+    proxyState.chat.model = mapModel(parsed.model)
+  }
+  log({ type: 'state_update', response: JSON.stringify({ mode: proxyState.chat.mode, model: proxyState.chat.model }) })
+  return sendJSON(res, 200, { ok: true, chat: proxyState.chat })
+}
+
+function handleLogs(res: ServerResponse) {
+  const params = new URL(req.url || '', `http://localhost:${PORT}`).searchParams
+  const limit = parseInt(params.get('limit') || '100', 10)
+  const type = params.get('type')
+  let logs = [...proxyState.logs].reverse()
+  if (type) logs = logs.filter((l) => l.type === type)
+  return sendJSON(res, 200, {
+    object: 'list',
+    data: logs.slice(0, limit),
+    total: proxyState.logs.length,
+  })
+}
+
+function handleAnalytics(res: ServerResponse) {
+  const chatLogs = proxyState.logs.filter((l) => l.type === 'chat')
+  const errorLogs = proxyState.logs.filter((l) => l.type === 'error')
+  const totalTokensIn = chatLogs.reduce((s, l) => s + (l.tokensIn || 0), 0)
+  const totalTokensOut = chatLogs.reduce((s, l) => s + (l.tokensOut || 0), 0)
+  const totalDurationMs = chatLogs.reduce((s, l) => s + (l.durationMs || 0), 0)
+  const continuations = chatLogs.filter((l) => l.isContinuation).length
+  const newChats = chatLogs.filter((l) => !l.isContinuation).length
+
+  // Group by chatId
+  const byChat = new Map<string, { count: number; tokensIn: number; tokensOut: number }>()
+  for (const l of chatLogs) {
+    const k = l.chatId || 'unknown'
+    const e = byChat.get(k) || { count: 0, tokensIn: 0, tokensOut: 0 }
+    e.count++
+    e.tokensIn += l.tokensIn || 0
+    e.tokensOut += l.tokensOut || 0
+    byChat.set(k, e)
+  }
+
+  // Group by model
+  const byModel = new Map<string, { count: number; tokensIn: number; tokensOut: number }>()
+  for (const l of chatLogs) {
+    const k = l.model || 'unknown'
+    const e = byModel.get(k) || { count: 0, tokensIn: 0, tokensOut: 0 }
+    e.count++
+    e.tokensIn += l.tokensIn || 0
+    e.tokensOut += l.tokensOut || 0
+    byModel.set(k, e)
+  }
+
+  // Last 24h buckets (hourly)
+  const now = Date.now()
+  const buckets: Array<{ hour: string; requests: number; tokens: number }> = []
+  for (let i = 23; i >= 0; i--) {
+    const start = now - i * 3600_000
+    const end = start + 3600_000
+    const hourLogs = chatLogs.filter((l) => l.timestamp >= start && l.timestamp < end)
+    buckets.push({
+      hour: new Date(start).toISOString().slice(0, 13),
+      requests: hourLogs.length,
+      tokens: hourLogs.reduce((s, l) => s + (l.tokensIn || 0) + (l.tokensOut || 0), 0),
+    })
+  }
+
+  return sendJSON(res, 200, {
+    totals: {
+      requests: proxyState.requestsHandled,
+      chat_requests: chatLogs.length,
+      errors: errorLogs.length,
+      new_chats: newChats,
+      continuations,
+      tokens_in: totalTokensIn,
+      tokens_out: totalTokensOut,
+      total_tokens: totalTokensIn + totalTokensOut,
+      avg_duration_ms: chatLogs.length ? Math.round(totalDurationMs / chatLogs.length) : 0,
+      uptime_s: Math.floor((Date.now() - proxyState.startedAt) / 1000),
+    },
+    by_chat: Array.from(byChat.entries()).map(([id, v]) => ({ chat_id: id, ...v })),
+    by_model: Array.from(byModel.entries()).map(([model, v]) => ({ model, ...v })),
+    hourly: buckets,
+    mode: proxyState.chat.mode,
+    current_chat: proxyState.chat.currentChatId,
   })
 }
 
 function handleHealth(res: ServerResponse) {
   return sendJSON(res, 200, {
     status: ready ? 'ok' : 'booting',
-    uptime_s: Math.floor((Date.now() - state.startedAt) / 1000),
-    requests_handled: state.requestsHandled,
-    last_error: state.lastError || null,
+    uptime_s: Math.floor((Date.now() - proxyState.startedAt) / 1000),
+    requests_handled: proxyState.requestsHandled,
+    last_error: proxyState.logs.filter((l) => l.type === 'error').slice(-1)[0]?.error || null,
     browser_url: page?.url() || null,
+    current_chat: proxyState.chat.currentChatId,
+    mode: proxyState.chat.mode,
   })
 }
 
-// Debug endpoint: drives the UI to send a message and returns the DOM snapshot.
+// Debug endpoint
 async function handleDebugSend(req: IncomingMessage, res: ServerResponse) {
   if (!ready || !page) return sendJSON(res, 503, { error: 'not ready' })
   const raw = await readBody(req)
@@ -796,72 +917,29 @@ async function handleDebugSend(req: IncomingMessage, res: ServerResponse) {
   }
   const msg = parsed.message || 'Hello'
   try {
-    // Click New Chat
-    await page.getByRole('button', { name: 'New Chat' }).click({ timeout: 5000 }).catch(() => {})
-    await page.waitForTimeout(500)
-    // Fill input
-    await page.getByPlaceholder('Ask Qwen').fill(msg)
-    await page.waitForTimeout(300)
-    // Click Send
-    await page.getByRole('button', { name: 'Send' }).click({ timeout: 5000 })
-    // Wait longer for the assistant message to fully stream
-    await page.waitForTimeout(9000)
-    // Capture the DOM structure of the main area
-    const domInfo = await page.evaluate(() => {
-      const main = document.querySelector('main')
-      if (!main) return { error: 'no main element' }
-      // Walk the tree and gather text + class info up to depth 10
-      const walk = (el: Element, depth: number): any => {
-        if (depth > 10) return null
-        const tag = el.tagName.toLowerCase()
-        const cls = el.className || ''
-        const role = el.getAttribute('role') || ''
-        const text = el.textContent || ''
-        const children: any[] = []
-        for (const c of Array.from(el.children)) {
-          const r = walk(c, depth + 1)
-          if (r) children.push(r)
-        }
-        return {
-          tag,
-          cls: typeof cls === 'string' ? cls.slice(0, 120) : '',
-          role,
-          text: text.slice(0, 300),
-          childCount: el.children.length,
-          children: children.slice(0, 12),
-        }
-      }
-      // Also: dump every element with a class containing 'message' or 'markdown'
-      const matches: any[] = []
-      main.querySelectorAll('*').forEach((el) => {
-        const cls = (typeof el.className === 'string' ? el.className : '') || ''
-        if (/message|markdown|answer|response|content-body/i.test(cls)) {
-          matches.push({
-            cls: cls.slice(0, 200),
-            tag: el.tagName.toLowerCase(),
-            text: (el.textContent || '').slice(0, 300),
-            childCount: el.children.length,
-          })
-        }
-      })
-      return { tree: walk(main, 0), messageElements: matches.slice(0, 30) }
+    await pageMutex.acquire(async () => {
+      await clickNewChat()
+      await fillAndSend(msg)
+      await page!.waitForURL(/\/c\/[a-f0-9-]+/i, { timeout: 10000 }).catch(() => {})
+      extractChatIdFromUrl()
     })
-    return sendJSON(res, 200, { ok: true, message: msg, dom: domInfo })
+    let full = ''
+    full = await streamResponse(() => {}, () => {})
+    return sendJSON(res, 200, { ok: true, message: msg, response: full, chat_id: proxyState.chat.currentChatId })
   } catch (e: any) {
     return sendJSON(res, 500, { error: e.message })
   }
 }
 
 // ---------------------------------------------------------------------------
-// Server
+// HTTP server
 // ---------------------------------------------------------------------------
 const server = createServer(async (req, res) => {
-  // CORS preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Chat-Id',
     })
     return res.end()
   }
@@ -872,12 +950,18 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/v1/models') return handleModels(res)
     if (req.method === 'POST' && url.pathname === '/v1/chat/completions')
       return await handleChatCompletions(req, res)
-    if (req.method === 'POST' && url.pathname === '/debug/send')
-      return await handleDebugSend(req, res)
+    if (req.method === 'GET' && url.pathname === '/v1/chats') return await handleChatsList(res)
+    if (req.method === 'POST' && url.pathname === '/v1/chats/select')
+      return await handleChatSelect(req, res)
+    if (req.method === 'POST' && url.pathname === '/v1/chats/new') return await handleChatNew(res)
+    if (req.method === 'GET' && url.pathname === '/v1/state') return handleStateGet(res)
+    if (req.method === 'POST' && url.pathname === '/v1/state') return handleStateSet(req, res)
+    if (req.method === 'GET' && url.pathname === '/v1/logs') return handleLogs(res)
+    if (req.method === 'GET' && url.pathname === '/v1/analytics') return handleAnalytics(res)
+    if (req.method === 'POST' && url.pathname === '/debug/send') return await handleDebugSend(req, res)
     sendJSON(res, 404, { error: { message: `No route for ${req.method} ${url.pathname}` } })
   } catch (e: any) {
     console.error('[server] unhandled:', e)
-    state.lastError = e.message
     if (!res.headersSent) sendJSON(res, 500, { error: { message: e.message } })
     else res.end()
   }
@@ -889,12 +973,9 @@ server.listen(PORT, async () => {
     await bootstrapBrowser()
   } catch (e: any) {
     console.error('[boot] FAILED:', e)
-    state.lastError = e.message
-    // Keep server alive so /health can report the error
   }
 })
 
-// Graceful shutdown
 const shutdown = async (sig: string) => {
   console.log(`\n[${sig}] shutting down…`)
   try {
@@ -905,8 +986,6 @@ const shutdown = async (sig: string) => {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
-
-// Prevent crashes from unhandled rejections (e.g. client aborts mid-stream).
 process.on('unhandledRejection', (reason) => {
   console.log('[unhandledRejection]', String(reason).slice(0, 200))
 })
