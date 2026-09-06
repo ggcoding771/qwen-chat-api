@@ -38,6 +38,7 @@ import {
   ExternalLink,
   Plus,
   Brain,
+  Download,
 } from 'lucide-react'
 
 // ---------------------------------------------------------------------------
@@ -310,6 +311,29 @@ function SetupTab({
           Configure your credentials and get an API key for Cline, LangChain, or any OpenAI-compatible client.
         </p>
       </div>
+
+      {/* Download zip — prominent at the top */}
+      <Card className="p-5 bg-gradient-to-br from-emerald-500 to-teal-600 text-white border-0 shadow-lg shadow-emerald-500/20">
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          <div className="flex-1 min-w-[200px]">
+            <h3 className="text-base font-semibold flex items-center gap-2">
+              <Download className="w-5 h-5" />
+              Download for Local Use
+            </h3>
+            <p className="text-xs text-emerald-50 mt-1">
+              Complete project + setup guide. Extract, edit <code className="bg-black/20 px-1 rounded">.env</code> with your Qwen credentials, run, and use with Cline.
+            </p>
+          </div>
+          <a
+            href="/qwen-chat-api-local.zip"
+            download
+            className="shrink-0 inline-flex items-center gap-2 bg-white text-emerald-700 font-medium px-4 py-2.5 rounded-lg hover:bg-emerald-50 transition-colors shadow-sm"
+          >
+            <Download className="w-4 h-4" />
+            Download ZIP
+          </a>
+        </div>
+      </Card>
 
       <Card className="p-6 space-y-4">
         <div>
