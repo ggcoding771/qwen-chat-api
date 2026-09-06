@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { width: 280px; font-family: system-ui, sans-serif; background: #0f0f1a; color: #e0e0e0; padding: 16px; }
+h2 { font-size: 16px; margin-bottom: 12px; }
+.status { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; }
+.dot.on { background: #4ade80; box-shadow: 0 0 8px #4ade80; }
+.dot.off { background: #f87171; }
+.tab { padding: 8px 12px; background: #1a1a2e; border-radius: 8px; margin-bottom: 6px; font-size: 13px; display: flex; justify-content: space-between; }
+.tab .ok { color: #4ade80; }
+.tab .no { color: #f87171; }
+.info { font-size: 11px; color: #666; margin-top: 12px; line-height: 1.5; }
+button { background: #2563eb; color: white; border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 13px; width: 100%; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h2>🔌 API Bridge</h2>
+<div class="status">
+  <div class="dot off" id="dot"></div>
+  <span id="status-text">Checking...</span>
+</div>
+<div id="tabs"></div>
+<button onclick="reconnect()">Reconnect</button>
+<div class="info">
+  Keep your Qwen/DeepSeek tabs open.<br>
+  Server: <code>localhost:8000</code><br>
+  Cline URL: <code>localhost:8000/v1</code>
+</div>
+<script>
+function updateStatus() {
+  chrome.runtime.sendMessage({ type: "check_connection" }, (res) => {
+    const dot = document.getElementById("dot");
+    const text = document.getElementById("status-text");
+    if (res && res.connected) {
+      dot.className = "dot on";
+      text.textContent = "Connected";
+    } else {
+      dot.className = "dot off";
+      text.textContent = "Disconnected — server not running?";
+    }
+  });
+  // Check which tabs are open
+  chrome.tabs.query({}, (tabs) => {
+    const container = document.getElementById("tabs");
+    container.innerHTML = "";
+    const sites = [
+      { url: "chat.qwen.ai", name: "Qwen" },
+      { url: "chat.deepseek.com", name: "DeepSeek" },
+    ];
+    for (const site of sites) {
+      const open = tabs.some((t) => t.url && t.url.includes(site.url));
+      const div = document.createElement("div");
+      div.className = "tab";
+      div.innerHTML = `${site.name} <span class="${open ? "ok" : "no"}">${open ? "✓ Open" : "✗ Closed"}</span>`;
+      container.appendChild(div);
+    }
+  });
+}
+function reconnect() {
+  chrome.runtime.sendMessage({ type: "reconnect" }, () => {
+    setTimeout(updateStatus, 1000);
+  });
+}
+updateStatus();
+setInterval(updateStatus, 3000);
+</script>
+</body>
+</html>
