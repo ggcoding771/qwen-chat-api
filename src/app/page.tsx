@@ -143,8 +143,10 @@ export default function Home() {
   const [config, setConfig] = useState(loadConfig)
   const [proxyStatus, setProxyStatus] = useState<'unknown' | 'ok' | 'down'>('unknown')
   const [proxyInfo, setProxyInfo] = useState<any>(null)
+  const [dsStatus, setDsStatus] = useState<'unknown' | 'ok' | 'down'>('unknown')
+  const [dsInfo, setDsInfo] = useState<any>(null)
 
-  // Poll proxy health
+  // Poll Qwen proxy health
   useEffect(() => {
     let active = true
     const check = async () => {
@@ -160,6 +162,32 @@ export default function Home() {
         }
       } catch {
         if (active) setProxyStatus('down')
+      }
+    }
+    check()
+    const interval = setInterval(check, 10000)
+    return () => { active = false; clearInterval(interval) }
+  }, [config.proxyUrl])
+
+  // Poll DeepSeek proxy health (port 3032)
+  useEffect(() => {
+    let active = true
+    const check = async () => {
+      try {
+        const base = config.proxyUrl
+          ? config.proxyUrl.replace(/\/+$/, '').replace(/:\d+$/, ':3032')
+          : `http://localhost:3032`
+        const r = await fetch(`${base}/health`)
+        if (!active) return
+        if (r.ok) {
+          const data = await r.json()
+          setDsStatus(data.status === 'ok' ? 'ok' : 'down')
+          setDsInfo(data)
+        } else {
+          setDsStatus('down')
+        }
+      } catch {
+        if (active) setDsStatus('down')
       }
     }
     check()
@@ -188,26 +216,43 @@ export default function Home() {
               </div>
               <div>
                 <h1 className="text-base font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
-                  Qwen Chat API
+                  AI Chat API
                 </h1>
                 <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                  OpenAI-compatible gateway for chat.qwen.ai
+                  Qwen + DeepSeek · OpenAI-compatible
                 </p>
               </div>
             </div>
-            <Badge
-              variant="outline"
-              className={`gap-1.5 ${
-                proxyStatus === 'ok'
-                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-800'
-                  : proxyStatus === 'down'
-                    ? 'bg-red-50 text-red-700 border-red-200 dark:bg-red-950/50 dark:text-red-300 dark:border-red-800'
-                    : 'bg-zinc-50 text-zinc-500 border-zinc-200 dark:bg-zinc-900 dark:text-zinc-400 dark:border-zinc-800'
-              }`}
-            >
-              <Activity className={`w-3 h-3 ${proxyStatus === 'ok' ? 'animate-pulse' : ''}`} />
-              {proxyStatus === 'ok' ? 'Online' : proxyStatus === 'down' ? 'Offline' : 'Checking…'}
-            </Badge>
+            <div className="flex items-center gap-2">
+              {/* Qwen status */}
+              <Badge
+                variant="outline"
+                className={`gap-1.5 ${
+                  proxyStatus === 'ok'
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-800'
+                    : proxyStatus === 'down'
+                      ? 'bg-red-50 text-red-700 border-red-200 dark:bg-red-950/50 dark:text-red-300 dark:border-red-800'
+                      : 'bg-zinc-50 text-zinc-500 border-zinc-200 dark:bg-zinc-900 dark:text-zinc-400 dark:border-zinc-800'
+                }`}
+              >
+                <Activity className={`w-3 h-3 ${proxyStatus === 'ok' ? 'animate-pulse' : ''}`} />
+                Qwen {proxyStatus === 'ok' ? 'Online' : proxyStatus === 'down' ? 'Off' : '…'}
+              </Badge>
+              {/* DeepSeek status */}
+              <Badge
+                variant="outline"
+                className={`gap-1.5 ${
+                  dsStatus === 'ok'
+                    ? 'bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/50 dark:text-blue-300 dark:border-blue-800'
+                    : dsStatus === 'down'
+                      ? 'bg-red-50 text-red-700 border-red-200 dark:bg-red-950/50 dark:text-red-300 dark:border-red-800'
+                      : 'bg-zinc-50 text-zinc-500 border-zinc-200 dark:bg-zinc-900 dark:text-zinc-400 dark:border-zinc-800'
+                }`}
+              >
+                <Activity className={`w-3 h-3 ${dsStatus === 'ok' ? 'animate-pulse' : ''}`} />
+                DS {dsStatus === 'ok' ? 'Online' : dsStatus === 'down' ? 'Off' : '…'}
+              </Badge>
+            </div>
           </div>
 
           {/* Tab bar */}
