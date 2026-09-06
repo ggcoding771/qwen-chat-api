@@ -38,7 +38,7 @@ try:
     from rich.markdown import Markdown
 except ImportError:
     print("Installing rich...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "rich"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "rich", "playwright"])
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
@@ -48,6 +48,14 @@ except ImportError:
     from rich.markdown import Markdown
 
 console = Console()
+
+# Ensure playwright browsers are installed
+def ensure_playwright():
+    try:
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except:
+        pass  # Not critical if it fails — manage.sh will handle it
 
 # Paths
 SCRIPT_DIR = Path(__file__).parent.parent  # project root
@@ -399,10 +407,13 @@ def show_dashboard():
 
 async def setup():
     """Main interactive setup."""
+    # Ensure playwright browsers are installed
+    ensure_playwright()
+
     console.print(Panel.fit(
-        "[bold emerald]Qwen + DeepSeek Chat API[/bold emerald]\n"
+        "[bold green]Qwen + DeepSeek Chat API[/bold green]\n"
         "[dim]OpenAI-compatible proxy for free AI chat services[/dim]",
-        border_style="emerald"
+        border_style="green"
     ))
 
     # Check existing sessions
