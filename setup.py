@@ -38,7 +38,16 @@ try:
     from rich.markdown import Markdown
 except ImportError:
     print("Installing rich...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "rich", "playwright"])
+    # Try --break-system-packages first (Debian/Ubuntu), then regular pip
+    for cmd in [
+        [sys.executable, "-m", "pip", "install", "--break-system-packages", "rich", "playwright"],
+        [sys.executable, "-m", "pip", "install", "rich", "playwright"],
+    ]:
+        try:
+            subprocess.check_call(cmd)
+            break
+        except subprocess.CalledProcessError:
+            continue
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
@@ -52,8 +61,16 @@ console = Console()
 # Ensure playwright browsers are installed
 def ensure_playwright():
     try:
-        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for cmd in [
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+            [sys.executable, "-m", "playwright", "install", "--break-system-packages", "chromium"],
+        ]:
+            try:
+                subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                break
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
     except:
         pass  # Not critical if it fails — manage.sh will handle it
 
@@ -105,11 +122,40 @@ async def browser_login(provider: str):
         from playwright.async_api import async_playwright
     except ImportError:
         console.print("[yellow]Installing playwright...[/yellow]")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
-        from playwright.async_api import async_playwright
+        # Use --break-system-packages for Debian/Ubuntu, or create venv
+        for cmd in [
+            [sys.executable, "-m", "pip", "install", "--break-system-packages", "playwright"],
+            [sys.executable, "-m", "pip", "install", "playwright"],
+        ]:
+            try:
+                subprocess.check_call(cmd)
+                break
+            except subprocess.CalledProcessError:
+                continue
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            # Fallback: create a venv
+            console.print("[yellow]Creating virtual environment...[/yellow]")
+            venv_dir = SCRIPT_DIR / "env"
+            subprocess.check_call([sys.executable, "-m", "venv", str(venv_dir)])
+            pip = str(venv_dir / "bin" / "pip")
+            subprocess.check_call([pip, "install", "playwright", "rich"])
+            subprocess.check_call([str(venv_dir / "bin" / "python"), "-m", "playwright", "install", "chromium"])
+            console.print(f"[green]Virtual environment created at {venv_dir}[/green]")
+            console.print(f"[yellow]Re-run this script with: {venv_dir}/bin/python setup.py[/yellow]")
+            return False
+
         console.print("[yellow]Installing chromium browser...[/yellow]")
-        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
-        from playwright.async_api import async_playwright
+        for cmd in [
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+        ]:
+            try:
+                subprocess.check_call(cmd)
+                break
+            except subprocess.CalledProcessError:
+                continue
 
     if provider == "qwen":
         url = "https://chat.qwen.ai"
