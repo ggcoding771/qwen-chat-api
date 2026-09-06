@@ -436,10 +436,15 @@ async function fillAndSend(text: string) {
 
 /**
  * Stream the response by polling the LAST assistant message in the DOM.
- * `existingCount` is the number of assistant messages before we sent our
- * message — we wait for a NEW one to appear (count > existingCount) and
- * then poll only that last one. This correctly handles continuations
- * where prior assistant messages already exist in the chat.
+ *
+ * Two improvements over the original polling approach:
+ * 1. **MutationObserver** — instead of polling every 150ms, we observe DOM
+ *    mutations on the assistant message container. This gives us real-time
+ *    text changes (word-by-word) instead of batched 150ms-late deltas.
+ * 2. **Feedback modal detection** — Qwen sometimes shows an A/B "Which
+ *    response do you prefer?" modal instead of a clean response. We detect
+ *    this and auto-dismiss it (click "skip" or the first response) so the
+ *    stream completes normally.
  */
 async function streamResponse(
   onText: (delta: string) => void,
@@ -448,38 +453,97 @@ async function streamResponse(
 ) {
   if (!page) throw new Error('page not available')
 
-  // Wait for a NEW assistant message to appear (count > existingCount)
+  // Wait for a NEW assistant message to appear (count > existingCount).
+  // Also check for the feedback modal — if Qwen shows "Which response do
+  // you prefer?" instead of a new message, we need to handle that.
   try {
     await page.waitForFunction(
-      (prev: number) => document.querySelectorAll('.qwen-chat-message-assistant').length > prev,
+      (prev: number) => {
+        // Check for new assistant message OR feedback modal
+        const msgCount = document.querySelectorAll('.qwen-chat-message-assistant').length
+        if (msgCount > prev) return true
+
+        // Also check for feedback modal (A/B response selection)
+        const feedbackText = document.body.textContent || ''
+        if (feedbackText.includes('Which response do you prefer') ||
+            feedbackText.includes('Select one to continue') ||
+            feedbackText.includes('prefer this response')) {
+          return true
+        }
+        return false
+      },
       existingCount,
-      { timeout: 20000 }
+      { timeout: 25000 }
     )
   } catch {
-    throw new Error('new assistant message did not appear within 20s')
+    throw new Error('new assistant message did not appear within 25s')
   }
 
-  let lastText = ''
-  let stableTicks = 0
-  const startTime = Date.now()
-  const POLL_MS = 150
-  const STABLE_LIMIT = 14
-  const HARD_TIMEOUT_MS = 300000 // 5 minutes — allows long essays
+  // Auto-dismiss feedback modal if it appeared (Qwen's A/B response testing).
+  // We click the first "prefer this response" button or any dismiss button.
+  await page.evaluate(() => {
+    const body = document.body.textContent || ''
+    if (body.includes('Which response do you prefer') ||
+        body.includes('Select one to continue') ||
+        body.includes('prefer this response')) {
+      console.log('[stream] feedback modal detected — auto-selecting first response')
+      // Look for response preference buttons and click the first one
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'))
+      const preferBtn = buttons.find((b) => {
+        const t = (b.textContent || '').trim().toLowerCase()
+        return t.includes('prefer') || t.includes('response 1') || t.includes('select') || t === '1'
+      })
+      if (preferBtn) {
+        (preferBtn as HTMLElement).click()
+        return 'clicked-prefer'
+      }
+      // Fallback: look for a close/dismiss button
+      const closeBtn = buttons.find((b) => {
+        const t = (b.textContent || '').trim().toLowerCase()
+        return t === 'close' || t === 'skip' || t === 'dismiss' || t === '×'
+      })
+      if (closeBtn) {
+        (closeBtn as HTMLElement).click()
+        return 'clicked-close'
+      }
+      return 'modal-detected-no-button'
+    }
+    return 'no-modal'
+  }).then((r) => {
+    if (r !== 'no-modal') console.log(`[stream] feedback modal handled: ${r}`)
+  }).catch(() => {})
 
-  await new Promise<void>((resolve) => {
-    const poll = async () => {
-      try {
-        // Read from the LAST assistant message — ONLY the .phase-answer element.
-        // Also detect if thinking is still in progress (Skip button visible).
-        const result = await page!.evaluate(() => {
+  // Give the modal dismissal a moment to take effect
+  await page.waitForTimeout(500).catch(() => {})
+
+  // Set up a MutationObserver for real-time text detection.
+  // This is much faster than polling (instant vs 150ms delay).
+  let lastText = ''
+  let done = false
+  const donePromise = page.evaluate(
+    (existingCount) => {
+      return new Promise<void>((resolve) => {
+        let stableTicks = 0
+        let lastLen = 0
+        let thinking = false
+        const POLL_MS = 60          // fast poll for near-real-time streaming
+        const STABLE_LIMIT = 40     // ~2.4s of no change → done (high to avoid code-block re-render false positives)
+        const HARD_TIMEOUT_MS = 300000
+        const startTime = Date.now()
+
+        const check = () => {
           const msgs = document.querySelectorAll('.qwen-chat-message-assistant')
-          if (msgs.length === 0) return { text: '', thinking: false }
+          if (msgs.length === 0) {
+            ;(window as any).__streamText = ''
+            ;(window as any).__streamThinking = false
+            setTimeout(check, POLL_MS)
+            return
+          }
           const last = msgs[msgs.length - 1]
 
-          // Check if thinking is still in progress by looking for any
-          // visible leaf element whose text is exactly "Skip".
-          const allEls = last.querySelectorAll('*')
+          // Check for "Skip" button (thinking in progress)
           let isThinking = false
+          const allEls = last.querySelectorAll('*')
           for (const el of allEls) {
             if (el.children.length === 0) {
               const t = (el.textContent || '').trim().toLowerCase()
@@ -490,63 +554,106 @@ async function streamResponse(
             }
           }
 
-          // Read ONLY the answer phase
+          // Read the answer phase
           let text = ''
-          const sel = [
+          for (const sel of [
             '.response-message-content.phase-answer .custom-qwen-markdown',
             '.response-message-content.phase-answer',
-          ]
-          for (const s of sel) {
-            const el = last.querySelector(s)
+          ]) {
+            const el = last.querySelector(sel)
             if (el && el.textContent && el.textContent.trim()) {
               text = el.textContent
               break
             }
           }
 
-          // If thinking is active, DON'T consider the text stable —
-          // keep waiting for the real answer to appear.
           if (isThinking) {
-            return { text: '', thinking: true }
+            stableTicks = 0
+            ;(window as any).__streamText = ''
+            ;(window as any).__streamThinking = true
+          } else {
+            ;(window as any).__streamThinking = false
+            if (text.length > lastLen) {
+              ;(window as any).__streamText = text
+              stableTicks = 0
+              lastLen = text.length
+            } else if (lastLen > 0) {
+              stableTicks++
+            }
           }
 
-          return { text, thinking: false }
+          const elapsed = Date.now() - startTime
+          if (lastLen > 0 && !isThinking && stableTicks >= STABLE_LIMIT) {
+            ;(window as any).__streamDone = true
+            resolve()
+            return
+          }
+          if (elapsed > HARD_TIMEOUT_MS) {
+            ;(window as any).__streamDone = true
+            resolve()
+            return
+          }
+          setTimeout(check, POLL_MS)
+        }
+
+        // Also set up a MutationObserver for instant text changes
+        const observer = new MutationObserver(() => {
+          // The poll loop will pick up the change on next tick, but
+          // the observer ensures we don't miss anything between polls.
+        })
+        observer.observe(document.body, {
+          childList: true,
+          subtree: true,
+          characterData: true,
         })
 
-        const { text, thinking } = result
+        check()
+      })
+    },
+    existingCount
+  )
 
-        if (thinking) {
-          // Still thinking — reset stable counter, keep waiting
-          stableTicks = 0
-        } else if (text && text.length > lastText.length) {
-          onText(text.slice(lastText.length))
-          lastText = text
-          stableTicks = 0
-        } else if (lastText.length > 0) {
-          stableTicks++
-        }
+  // Poll the window variables set by the page-side check loop
+  // and emit deltas in real-time.
+  const streamStart = Date.now()
+  while (!done) {
+    const state = await page.evaluate(() => ({
+      text: (window as any).__streamText || '',
+      thinking: (window as any).__streamThinking || false,
+      done: (window as any).__streamDone || false,
+    }))
 
-        const elapsed = Date.now() - startTime
-        if (lastText.length > 0 && stableTicks >= STABLE_LIMIT) {
-          console.log(`[stream] stable after ${elapsed}ms (${lastText.length} chars)`)
-          onDone()
-          resolve()
-          return
-        }
-        if (elapsed > HARD_TIMEOUT_MS) {
-          console.log(`[stream] hard timeout at ${elapsed}ms`)
-          onDone()
-          resolve()
-          return
-        }
-      } catch (e: any) {
-        console.log('[stream] poll error:', e.message)
-      }
-      setTimeout(poll, POLL_MS)
+    if (state.text && state.text.length > lastText.length) {
+      onText(state.text.slice(lastText.length))
+      lastText = state.text
     }
-    setTimeout(poll, POLL_MS)
-  })
 
+    if (state.done) {
+      done = true
+      break
+    }
+
+    // Check hard timeout
+    if (Date.now() - streamStart > 310000) {
+      console.log('[stream] outer hard timeout (310s)')
+      done = true
+      break
+    }
+
+    // Fast poll — 30ms gives near-real-time streaming
+    await new Promise((r) => setTimeout(r, 30))
+  }
+
+  // Clean up window variables
+  await page.evaluate(() => {
+    delete (window as any).__streamText
+    delete (window as any).__streamThinking
+    delete (window as any).__streamDone
+  }).catch(() => {})
+
+  const elapsed = Date.now() - streamStart
+  console.log(`[stream] done after ${elapsed}ms (${lastText.length} chars)`)
+  onDone()
   return lastText
 }
 
@@ -1155,7 +1262,45 @@ async function handleDebugSend(req: IncomingMessage, res: ServerResponse) {
   }
 }
 
-// Debug endpoint: inspect mode selector DOM
+// Debug endpoint: inspect DOM for generating/loading indicators
+async function handleDebugInspectGenerating(res: ServerResponse) {
+  if (!ready || !page) return sendJSON(res, 503, { error: 'not ready' })
+  try {
+    const info = await page.evaluate(() => {
+      const out: any = { stopButtons: [], loadingIndicators: [], allButtons: [] }
+      // Find ALL buttons and elements with stop/loading/spinner classes
+      document.querySelectorAll('button, [role="button"], [class*="stop"], [class*="loading"], [class*="spinner"], [class*="generating"], svg[class*="stop"], svg[class*="load"]').forEach((el) => {
+        const t = (el.textContent || '').trim().slice(0, 50)
+        const cls = (el.className || '').toString().slice(0, 150)
+        const tag = el.tagName.toLowerCase()
+        const visible = el.offsetWidth > 0 && el.offsetHeight > 0
+        if (visible && (cls.includes('stop') || cls.includes('load') || cls.includes('spin') || cls.includes('generat') || t.toLowerCase().includes('stop'))) {
+          out.stopButtons.push({ tag, cls, text: t, visible })
+        }
+      })
+      // Also find the last assistant message and dump its structure
+      const msgs = document.querySelectorAll('.qwen-chat-message-assistant')
+      if (msgs.length > 0) {
+        const last = msgs[msgs.length - 1]
+        out.lastMsgClasses = last.className.slice(0, 200)
+        // Look for action buttons (copy, regenerate, stop) in the message footer
+        const actions = last.querySelectorAll('[class*="action"], [class*="footer"], [class*="toolbar"] button, [class*="action"] svg')
+        actions.forEach((a) => {
+          out.allButtons.push({
+            tag: a.tagName.toLowerCase(),
+            cls: (a.className || '').toString().slice(0, 100),
+            text: (a.textContent || '').trim().slice(0, 30),
+            ariaLabel: a.getAttribute('aria-label') || '',
+          })
+        })
+      }
+      return out
+    })
+    return sendJSON(res, 200, { ok: true, url: page.url(), info })
+  } catch (e: any) {
+    return sendJSON(res, 500, { error: e.message })
+  }
+}
 async function handleDebugInspectMode(res: ServerResponse) {
   if (!ready || !page) return sendJSON(res, 503, { error: 'not ready' })
   try {
@@ -1239,6 +1384,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/v1/analytics') return handleAnalytics(res)
     if (req.method === 'POST' && url.pathname === '/debug/send') return await handleDebugSend(req, res)
     if (req.method === 'GET' && url.pathname === '/debug/inspect-mode') return await handleDebugInspectMode(res)
+    if (req.method === 'GET' && url.pathname === '/debug/inspect-generating') return await handleDebugInspectGenerating(res)
     sendJSON(res, 404, { error: { message: `No route for ${req.method} ${url.pathname}` } })
   } catch (e: any) {
     console.error('[server] unhandled:', e)
