@@ -1,0 +1,5 @@
+.env
+.browser-data/
+storage-state.json
+node_modules/
+*.log

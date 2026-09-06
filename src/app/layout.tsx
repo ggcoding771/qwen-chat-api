@@ -14,24 +14,22 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Z.ai Code Scaffold - AI-Powered Development",
-  description: "Modern Next.js scaffold optimized for AI-powered development with Z.ai. Built with TypeScript, Tailwind CSS, and shadcn/ui.",
-  keywords: ["Z.ai", "Next.js", "TypeScript", "Tailwind CSS", "shadcn/ui", "AI development", "React"],
-  authors: [{ name: "Z.ai Team" }],
+  title: "Qwen Chat API — OpenAI-compatible gateway for chat.qwen.ai",
+  description: "An OpenAI-compatible API proxy that drives a real browser session on chat.qwen.ai to satisfy Baxia anti-bot. Drop-in replacement for /v1/chat/completions.",
+  keywords: ["Qwen", "OpenAI", "API", "Baxia", "proxy", "Next.js", "TypeScript"],
+  authors: [{ name: "Qwen Chat API" }],
   icons: {
     icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
   },
   openGraph: {
-    title: "Z.ai Code Scaffold",
-    description: "AI-powered development with modern React stack",
-    url: "https://chat.z.ai",
-    siteName: "Z.ai",
+    title: "Qwen Chat API",
+    description: "OpenAI-compatible gateway for chat.qwen.ai",
     type: "website",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Z.ai Code Scaffold",
-    description: "AI-powered development with modern React stack",
+    title: "Qwen Chat API",
+    description: "OpenAI-compatible gateway for chat.qwen.ai",
   },
 };
 
