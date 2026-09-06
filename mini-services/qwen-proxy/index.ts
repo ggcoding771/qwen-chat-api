@@ -156,6 +156,119 @@ function log(entry: Omit<LogEntry, 'id' | 'timestamp'>) {
   return full
 }
 
+// Inject the fetch + XHR interceptor into the main page context.
+// This patches window.fetch AND XMLHttpRequest so we can capture SSE responses
+// from Qwen's API regardless of which HTTP client axios uses.
+// Must be called AFTER page.goto() so the page context exists.
+async function injectFetchInterceptor() {
+  if (!page) return
+  await page.evaluate(() => {
+    if ((window as any).__qwenInterceptorInstalled) return
+    ;(window as any).__qwenInterceptorInstalled = true
+    // DON'T clear __qwenStreamCallback here — it may have been set by
+    // streamResponse() before this injection (e.g., after clickNewChat).
+    // Only initialize if not already set.
+    if (!(window as any).__qwenStreamCallback) (window as any).__qwenStreamCallback = null
+    if (!(window as any).__qwenStreamDone) (window as any).__qwenStreamDone = null
+    if (!(window as any).__qwenStreamError) (window as any).__qwenStreamError = null
+
+    // --- Patch window.fetch ---
+    const originalFetch = window.fetch
+    window.fetch = async function (input: any, init?: any) {
+      const urlString = typeof input === 'string' ? input : input?.url || ''
+      const response = await originalFetch.call(this, input, init)
+
+      if (urlString.includes('/chat/completions') &&
+          (window as any).__qwenStreamCallback &&
+          response.body && response.body.tee) {
+        try {
+          const [stream1, stream2] = response.body.tee()
+          const reader = stream2.getReader()
+          const decoder = new TextDecoder()
+          const cb = (window as any).__qwenStreamCallback
+          const doneCb = (window as any).__qwenStreamDone
+          const errCb = (window as any).__qwenStreamError
+
+          // Mark that fetch is handling this — prevents XHR from duplicating
+          ;(window as any).__qwenFetchDelivered = true
+
+          ;(async () => {
+            try {
+              while (true) {
+                const { done, value } = await reader.read()
+                if (done) break
+                const text = decoder.decode(value, { stream: true })
+                if (cb) cb(text)
+              }
+              if (doneCb) doneCb()
+            } catch (e: any) {
+              if (errCb) errCb(String(e?.message || e))
+            }
+          })()
+
+          return new Response(stream1, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          })
+        } catch (e) {
+          console.log('[interceptor] fetch tee failed:', e)
+          return response
+        }
+      }
+      return response
+    } as any
+
+    // --- Patch XMLHttpRequest (fallback — Qwen's axios uses fetch for streams) ---
+    // Only needed if axios falls back to XHR for some reason.
+    // We use a flag to avoid duplicate delivery if fetch already captured it.
+    const OriginalXHR = window.XMLHttpRequest
+    const originalOpen = OriginalXHR.prototype.open
+    const originalSend = OriginalXHR.prototype.send
+
+    OriginalXHR.prototype.open = function (method: string, url: string, ...rest: any[]) {
+      (this as any).__qwenUrl = url
+      ;(this as any).__qwenDelivered = false
+      return originalOpen.call(this, method, url, ...rest)
+    }
+
+    OriginalXHR.prototype.send = function (body: any) {
+      const url = (this as any).__qwenUrl || ''
+      if (url.includes('/chat/completions') && (window as any).__qwenStreamCallback) {
+        const cb = (window as any).__qwenStreamCallback
+        const doneCb = (window as any).__qwenStreamDone
+        const xhr = this
+        const originalOnReady = (this as any).onreadystatechange
+        ;(this as any).onreadystatechange = function () {
+          // Skip XHR delivery if fetch already handled it (avoid duplicates)
+          if ((window as any).__qwenFetchDelivered) {
+            if (originalOnReady) originalOnReady.call(xhr)
+            return
+          }
+          if (!xhr.__qwenDelivered && xhr.readyState >= 3 && xhr.responseText) {
+            try {
+              const full = xhr.responseText
+              const newPart = full.slice((xhr as any).__lastForwardedLen || 0)
+              if (newPart) {
+                cb(newPart)
+                ;(xhr as any).__lastForwardedLen = full.length
+              }
+            } catch (e) {}
+          }
+          if (xhr.readyState === 4 && !xhr.__qwenDelivered) {
+            xhr.__qwenDelivered = true
+            if (doneCb) doneCb()
+          }
+          if (originalOnReady) originalOnReady.call(xhr)
+        }
+      }
+      return originalSend.call(this, body)
+    }
+
+    console.log('[interceptor] fetch + XHR interceptor installed in main context')
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Browser bootstrap + login
 // ---------------------------------------------------------------------------
@@ -181,6 +294,12 @@ async function bootstrapBrowser() {
 
   await page.goto(QWEN_HOME, { waitUntil: 'domcontentloaded' })
   await page.waitForTimeout(2500)
+
+  // Inject the fetch interceptor DIRECTLY into the main page context.
+  // addInitScript runs in an isolated world and doesn't patch Qwen's fetch.
+  // We need to inject via evaluate() so it runs in the same world as Qwen's app.
+  await injectFetchInterceptor()
+
 
   const authed = await page.evaluate(async () => {
     const r = await fetch('/api/v1/auths/', { credentials: 'include' })
@@ -333,6 +452,8 @@ async function clickNewChat() {
   proxyState.chat.currentChatUrl = null
   proxyState.chat.firstUserMessageHash = null
   proxyState.chat.lastUserMessage = null
+  // Re-inject the interceptor in case the page navigated
+  await injectFetchInterceptor()
 }
 
 async function navigateToChat(chatId: string) {
@@ -340,6 +461,8 @@ async function navigateToChat(chatId: string) {
   console.log(`[ui] navigating to chat ${chatId}…`)
   await page.goto(`${QWEN_HOME}/c/${chatId}`, { waitUntil: 'domcontentloaded' })
   await page.waitForTimeout(2500)
+  // Re-inject the interceptor after navigation (page reloads lose the patch)
+  await injectFetchInterceptor()
   proxyState.chat.currentChatId = chatId
   proxyState.chat.currentChatUrl = page.url()
 }
@@ -435,226 +558,133 @@ async function fillAndSend(text: string) {
 }
 
 /**
- * Stream the response by polling the LAST assistant message in the DOM.
+ * Stream the response by intercepting Qwen's API SSE stream.
  *
- * Two improvements over the original polling approach:
- * 1. **MutationObserver** — instead of polling every 150ms, we observe DOM
- *    mutations on the assistant message container. This gives us real-time
- *    text changes (word-by-word) instead of batched 150ms-late deltas.
- * 2. **Feedback modal detection** — Qwen sometimes shows an A/B "Which
- *    response do you prefer?" modal instead of a clean response. We detect
- *    this and auto-dismiss it (click "skip" or the first response) so the
- *    stream completes normally.
+ * How it works:
+ * 1. We inject a fetch interceptor (via addInitScript) that captures
+ *    responses to /chat/completions
+ * 2. Before sending a message, we register callbacks on window
+ * 3. We drive the UI to send (click Send) — Qwen's app makes the API call
+ * 4. The interceptor tees the response stream and forwards chunks to us
+ * 5. We parse the SSE format and extract answer deltas (content field)
+ *
+ * This gives us REAL streaming (instant, not polled) and proper [DONE]
+ * detection — no more DOM scraping, stable thresholds, or code-block issues.
  */
 async function streamResponse(
   onText: (delta: string) => void,
   onDone: () => void,
-  existingCount = 0
+  callbackName: string
 ) {
   if (!page) throw new Error('page not available')
 
-  // Wait for a NEW assistant message to appear (count > existingCount).
-  // Also check for the feedback modal — if Qwen shows "Which response do
-  // you prefer?" instead of a new message, we need to handle that.
-  try {
-    await page.waitForFunction(
-      (prev: number) => {
-        // Check for new assistant message OR feedback modal
-        const msgCount = document.querySelectorAll('.qwen-chat-message-assistant').length
-        if (msgCount > prev) return true
+  // The callback was already registered by executeSend() BEFORE the message
+  // was sent. We just need to poll the window variable and process chunks.
+  let streamDone = false
+  let streamError: string | null = null
 
-        // Also check for feedback modal (A/B response selection)
-        const feedbackText = document.body.textContent || ''
-        if (feedbackText.includes('Which response do you prefer') ||
-            feedbackText.includes('Select one to continue') ||
-            feedbackText.includes('prefer this response')) {
-          return true
-        }
-        return false
-      },
-      existingCount,
-      { timeout: 25000 }
-    )
-  } catch {
-    throw new Error('new assistant message did not appear within 25s')
-  }
+  const startTime = Date.now()
+  const HARD_TIMEOUT_MS = 300000
 
-  // Auto-dismiss feedback modal if it appeared (Qwen's A/B response testing).
-  // We click the first "prefer this response" button or any dismiss button.
-  await page.evaluate(() => {
-    const body = document.body.textContent || ''
-    if (body.includes('Which response do you prefer') ||
-        body.includes('Select one to continue') ||
-        body.includes('prefer this response')) {
-      console.log('[stream] feedback modal detected — auto-selecting first response')
-      // Look for response preference buttons and click the first one
-      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'))
-      const preferBtn = buttons.find((b) => {
-        const t = (b.textContent || '').trim().toLowerCase()
-        return t.includes('prefer') || t.includes('response 1') || t.includes('select') || t === '1'
-      })
-      if (preferBtn) {
-        (preferBtn as HTMLElement).click()
-        return 'clicked-prefer'
+  let lastProcessedLen = 0
+  let fullText = ''
+
+  while (!streamDone) {
+    const state = await page.evaluate((cbName: string) => {
+      const arr = (window as any)[cbName] || []
+      return {
+        chunks: arr.slice(),
+        chunkCount: arr.length,
+        done: !!(window as any).__streamDoneFlag,
+        error: (window as any).__streamError || null,
       }
-      // Fallback: look for a close/dismiss button
-      const closeBtn = buttons.find((b) => {
-        const t = (b.textContent || '').trim().toLowerCase()
-        return t === 'close' || t === 'skip' || t === 'dismiss' || t === '×'
-      })
-      if (closeBtn) {
-        (closeBtn as HTMLElement).click()
-        return 'clicked-close'
-      }
-      return 'modal-detected-no-button'
-    }
-    return 'no-modal'
-  }).then((r) => {
-    if (r !== 'no-modal') console.log(`[stream] feedback modal handled: ${r}`)
-  }).catch(() => {})
+    }, callbackName)
 
-  // Give the modal dismissal a moment to take effect
-  await page.waitForTimeout(500).catch(() => {})
-
-  // Set up a MutationObserver for real-time text detection.
-  // This is much faster than polling (instant vs 150ms delay).
-  let lastText = ''
-  let done = false
-  const donePromise = page.evaluate(
-    (existingCount) => {
-      return new Promise<void>((resolve) => {
-        let stableTicks = 0
-        let lastLen = 0
-        let thinking = false
-        const POLL_MS = 60          // fast poll for near-real-time streaming
-        const STABLE_LIMIT = 40     // ~2.4s of no change → done (high to avoid code-block re-render false positives)
-        const HARD_TIMEOUT_MS = 300000
-        const startTime = Date.now()
-
-        const check = () => {
-          const msgs = document.querySelectorAll('.qwen-chat-message-assistant')
-          if (msgs.length === 0) {
-            ;(window as any).__streamText = ''
-            ;(window as any).__streamThinking = false
-            setTimeout(check, POLL_MS)
-            return
+    // Process new chunks
+    if (state.chunkCount > lastProcessedLen) {
+      const newChunks = state.chunks.slice(lastProcessedLen)
+      for (const chunk of newChunks) {
+        const lines = chunk.split('\n')
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('data:')) continue
+          const payload = trimmed.slice(5).trim()
+          if (payload === '[DONE]') {
+            streamDone = true
+            continue
           }
-          const last = msgs[msgs.length - 1]
+          try {
+            const json = JSON.parse(payload)
+            let delta = ''
 
-          // Check for "Skip" button (thinking in progress)
-          let isThinking = false
-          const allEls = last.querySelectorAll('*')
-          for (const el of allEls) {
-            if (el.children.length === 0) {
-              const t = (el.textContent || '').trim().toLowerCase()
-              if (t === 'skip' && el.offsetWidth > 0 && el.offsetHeight > 0) {
-                isThinking = true
-                break
+            // OpenAI-style: choices[0].delta.content
+            const choices = json.choices
+            if (Array.isArray(choices) && choices[0]?.delta?.content) {
+              delta = choices[0].delta.content
+            }
+
+            // Qwen content_list: array of phases
+            if (!delta) {
+              const cl = json.content_list
+              if (Array.isArray(cl)) {
+                for (const item of cl) {
+                  if (item?.phase === 'answer' && typeof item.content === 'string') {
+                    delta += item.content
+                  }
+                }
               }
             }
-          }
 
-          // Read the answer phase
-          let text = ''
-          for (const sel of [
-            '.response-message-content.phase-answer .custom-qwen-markdown',
-            '.response-message-content.phase-answer',
-          ]) {
-            const el = last.querySelector(sel)
-            if (el && el.textContent && el.textContent.trim()) {
-              text = el.textContent
-              break
+            // Fallback: top-level content
+            if (!delta && typeof json.content === 'string') {
+              delta = json.content
             }
-          }
 
-          if (isThinking) {
-            stableTicks = 0
-            ;(window as any).__streamText = ''
-            ;(window as any).__streamThinking = true
-          } else {
-            ;(window as any).__streamThinking = false
-            if (text.length > lastLen) {
-              ;(window as any).__streamText = text
-              stableTicks = 0
-              lastLen = text.length
-            } else if (lastLen > 0) {
-              stableTicks++
+            if (delta) {
+              fullText += delta
+              onText(delta)
             }
+          } catch {
+            // ignore non-JSON keep-alive lines
           }
-
-          const elapsed = Date.now() - startTime
-          if (lastLen > 0 && !isThinking && stableTicks >= STABLE_LIMIT) {
-            ;(window as any).__streamDone = true
-            resolve()
-            return
-          }
-          if (elapsed > HARD_TIMEOUT_MS) {
-            ;(window as any).__streamDone = true
-            resolve()
-            return
-          }
-          setTimeout(check, POLL_MS)
         }
+      }
+      lastProcessedLen = state.chunkCount
+    }
 
-        // Also set up a MutationObserver for instant text changes
-        const observer = new MutationObserver(() => {
-          // The poll loop will pick up the change on next tick, but
-          // the observer ensures we don't miss anything between polls.
-        })
-        observer.observe(document.body, {
-          childList: true,
-          subtree: true,
-          characterData: true,
-        })
-
-        check()
-      })
-    },
-    existingCount
-  )
-
-  // Poll the window variables set by the page-side check loop
-  // and emit deltas in real-time.
-  const streamStart = Date.now()
-  while (!done) {
-    const state = await page.evaluate(() => ({
-      text: (window as any).__streamText || '',
-      thinking: (window as any).__streamThinking || false,
-      done: (window as any).__streamDone || false,
-    }))
-
-    if (state.text && state.text.length > lastText.length) {
-      onText(state.text.slice(lastText.length))
-      lastText = state.text
+    if (state.error) {
+      streamError = state.error
+      break
     }
 
     if (state.done) {
-      done = true
+      streamDone = true
       break
     }
 
-    // Check hard timeout
-    if (Date.now() - streamStart > 310000) {
-      console.log('[stream] outer hard timeout (310s)')
-      done = true
+    if (Date.now() - startTime > HARD_TIMEOUT_MS) {
+      console.log('[stream] hard timeout (300s)')
       break
     }
 
-    // Fast poll — 30ms gives near-real-time streaming
-    await new Promise((r) => setTimeout(r, 30))
+    // Fast poll — 20ms for near-real-time streaming
+    await new Promise((r) => setTimeout(r, 20))
   }
 
-  // Clean up window variables
-  await page.evaluate(() => {
-    delete (window as any).__streamText
-    delete (window as any).__streamThinking
-    delete (window as any).__streamDone
-  }).catch(() => {})
+  // Cleanup window variables
+  await page.evaluate((cbName: string) => {
+    ;(window as any).__qwenStreamCallback = null
+    ;(window as any).__qwenStreamDone = null
+    ;(window as any).__qwenStreamError = null
+    ;(window as any).__streamDoneFlag = false
+    ;(window as any).__streamError = null
+    delete (window as any)[cbName]
+  }, callbackName).catch(() => {})
 
-  const elapsed = Date.now() - streamStart
-  console.log(`[stream] done after ${elapsed}ms (${lastText.length} chars)`)
+  const elapsed = Date.now() - startTime
+  console.log(`[stream] done after ${elapsed}ms (${fullText.length} chars)`)
   onDone()
-  return lastText
+  return fullText
 }
 
 // ---------------------------------------------------------------------------
@@ -808,7 +838,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
   const startTime = Date.now()
 
   // Execute the UI flow under the mutex
-  const executeSend = async (): Promise<number> => {
+  const executeSend = async (): Promise<void> => {
     // Set mode before sending
     await setMode(desiredMode)
 
@@ -821,13 +851,30 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
       }
     }
 
-    // Count existing assistant messages BEFORE sending, so streamResponse
-    // knows to wait for a NEW one (count > existing) and poll only the last.
-    const existingCount = await page!.evaluate(() => {
-      return document.querySelectorAll('.qwen-chat-message-assistant').length
-    })
-    console.log(`[executeSend] existing assistant messages: ${existingCount}`)
+    // CRITICAL: Register the stream callback BEFORE sending the message.
+    // The fetch interceptor checks for __qwenStreamCallback when the API
+    // response arrives. If we set it after the send, we miss the stream.
+    const callbackName = '__qwenChunk_' + Math.random().toString(36).slice(2, 10)
+    await page!.evaluate((cbName: string) => {
+      ;(window as any).__qwenStreamCallback = (text: string) => {
+        const arr = (window as any)[cbName] = (window as any)[cbName] || []
+        arr.push(text)
+      }
+      ;(window as any).__qwenStreamDone = () => {
+        ;(window as any).__streamDoneFlag = true
+      }
+      ;(window as any).__qwenStreamError = (err: string) => {
+        ;(window as any).__streamError = err
+      }
+      // Reset delivery flags so fetch and XHR don't think the previous
+      // stream is still being delivered
+      ;(window as any).__qwenFetchDelivered = false
+      ;(window as any).__streamDoneFlag = false
+      ;(window as any).__streamError = null
+    }, callbackName)
 
+    // Send the message — this triggers Qwen's API call, which our
+    // interceptor captures to get the SSE stream.
     await fillAndSend(promptToSend)
 
     // For new chats, extract the chatId from the URL after sending
@@ -847,7 +894,9 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
     }
     proxyState.chat.lastUserMessage = lastUserContent
     proxyState.chat.model = model
-    return existingCount
+
+    // Return the callback name so streamResponse knows which window var to read
+    return callbackName as any
   }
 
   if (stream) {
@@ -872,7 +921,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
     let fullText = ''
     try {
       await pageMutex.acquire(async () => {
-        const existingCount = await executeSend()
+        const cbName = await executeSend() as any
         fullText = await streamResponse(
           (text) => {
             res.write(
@@ -886,7 +935,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
             )
           },
           () => {},
-          existingCount
+          cbName
         )
       })
 
@@ -936,11 +985,11 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse) 
   let fullText = ''
   try {
     await pageMutex.acquire(async () => {
-      const existingCount = await executeSend()
+      const cbName = await executeSend() as any
       fullText = await streamResponse(
         () => {},
         () => {},
-        existingCount
+        cbName
       )
     })
   } catch (e: any) {
