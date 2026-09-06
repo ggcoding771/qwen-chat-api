@@ -67,3 +67,4 @@ skills/
 
 # Tests
 tests/
+proxy.pid

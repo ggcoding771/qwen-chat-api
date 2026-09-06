@@ -946,7 +946,7 @@ const server = createServer(async (req, res) => {
 
   const url = new URL(req.url || '/', `http://localhost:${PORT}`)
   try {
-    if (req.method === 'GET' && url.pathname === '/health') return handleHealth(res)
+    if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/v1/health')) return handleHealth(res)
     if (req.method === 'GET' && url.pathname === '/v1/models') return handleModels(res)
     if (req.method === 'POST' && url.pathname === '/v1/chat/completions')
       return await handleChatCompletions(req, res)
