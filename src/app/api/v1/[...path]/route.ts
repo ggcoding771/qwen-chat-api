@@ -1,8 +1,7 @@
 import { NextRequest } from 'next/server'
 
-export const runtime = 'nodejs'
+export const runtime = 'edge'
 export const dynamic = 'force-dynamic'
-export const maxDuration = 300 // 5 minutes — allows long essays
 
 const PROXY_PORT = 3030
 
@@ -10,8 +9,12 @@ const PROXY_PORT = 3030
  * Catch-all proxy: forwards any /api/v1/* request to the qwen-proxy
  * mini-service on localhost:3030. Supports streaming (SSE) responses.
  *
- * Uses Node.js runtime (not Edge) because Edge runtime has a ~25s CPU
- * time limit that kills long-running streams (e.g. 1000-word essays).
+ * Uses Edge runtime for Cloudflare Pages compatibility.
+ *
+ * NOTE: Edge runtime has a ~25s CPU time limit. For long streaming
+ * responses (essays, etc.), use the direct proxy URL option in the
+ * dashboard Setup tab — it connects browser→proxy directly, bypassing
+ * Next.js entirely.
  */
 async function handler(req: NextRequest) {
   const path = req.nextUrl.pathname.replace(/^\/api\/v1/, '')
