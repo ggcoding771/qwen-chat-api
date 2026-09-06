@@ -1,7 +1,8 @@
 import { NextRequest } from 'next/server'
 
-export const runtime = 'edge'
+export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
+export const maxDuration = 300 // 5 minutes — allows long essays
 
 const PROXY_PORT = 3030
 
@@ -9,13 +10,8 @@ const PROXY_PORT = 3030
  * Catch-all proxy: forwards any /api/v1/* request to the qwen-proxy
  * mini-service on localhost:3030. Supports streaming (SSE) responses.
  *
- * Examples:
- *   GET  /api/v1/chats             → localhost:3030/v1/chats
- *   POST /api/v1/chats/select      → localhost:3030/v1/chats/select
- *   GET  /api/v1/logs              → localhost:3030/v1/logs
- *   GET  /api/v1/analytics         → localhost:3030/v1/analytics
- *   GET  /api/v1/state             → localhost:3030/v1/state
- *   POST /api/v1/state             → localhost:3030/v1/state
+ * Uses Node.js runtime (not Edge) because Edge runtime has a ~25s CPU
+ * time limit that kills long-running streams (e.g. 1000-word essays).
  */
 async function handler(req: NextRequest) {
   const path = req.nextUrl.pathname.replace(/^\/api\/v1/, '')

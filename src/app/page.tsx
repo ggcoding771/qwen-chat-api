@@ -115,6 +115,24 @@ function genApiKey() {
   return 'sk-qwen-' + Array.from({ length: 32 }, () => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]).join('')
 }
 
+/**
+ * Build the full API URL for a given path.
+ * If proxyUrl is set (e.g. "http://localhost:3030"), call the proxy directly.
+ * Otherwise, use the Next.js route (/api/v1/...) which relays to localhost:3030.
+ *
+ * Direct proxy calls are faster (no double-hop) and don't hit Edge runtime
+ * limits — better for long streaming responses.
+ */
+function apiUrl(path: string, proxyUrl?: string): string {
+  if (proxyUrl) {
+    const base = proxyUrl.replace(/\/+$/, '')
+    // Proxy serves /v1/* and /health
+    if (path === '/health') return `${base}/health`
+    return `${base}/v1${path}`
+  }
+  return `/api/v1${path}`
+}
+
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
@@ -129,7 +147,7 @@ export default function Home() {
     let active = true
     const check = async () => {
       try {
-        const r = await fetch('/api/v1/health')
+        const r = await fetch(apiUrl('/health', config.proxyUrl))
         if (!active) return
         if (r.ok) {
           const data = await r.json()
@@ -145,7 +163,7 @@ export default function Home() {
     check()
     const interval = setInterval(check, 10000)
     return () => { active = false; clearInterval(interval) }
-  }, [])
+  }, [config.proxyUrl])
 
   const tabs: Array<{ id: Tab; label: string; icon: any }> = [
     { id: 'setup', label: 'Setup', icon: KeyRound },
@@ -214,11 +232,11 @@ export default function Home() {
       <main className="flex-1 overflow-y-auto">
         <div className="max-w-6xl mx-auto px-4 py-6">
           {tab === 'setup' && <SetupTab config={config} setConfig={setConfig} proxyInfo={proxyInfo} />}
-          {tab === 'chats' && <ChatsTab proxyInfo={proxyInfo} />}
-          {tab === 'playground' && <PlaygroundTab />}
-          {tab === 'logs' && <LogsTab />}
-          {tab === 'analytics' && <AnalyticsTab proxyInfo={proxyInfo} />}
-          {tab === 'settings' && <SettingsTab proxyInfo={proxyInfo} />}
+          {tab === 'chats' && <ChatsTab proxyInfo={proxyInfo} proxyUrl={config.proxyUrl} />}
+          {tab === 'playground' && <PlaygroundTab proxyUrl={config.proxyUrl} />}
+          {tab === 'logs' && <LogsTab proxyUrl={config.proxyUrl} />}
+          {tab === 'analytics' && <AnalyticsTab proxyInfo={proxyInfo} proxyUrl={config.proxyUrl} />}
+          {tab === 'settings' && <SettingsTab proxyInfo={proxyInfo} proxyUrl={config.proxyUrl} />}
         </div>
       </main>
 
@@ -252,12 +270,13 @@ function SetupTab({
 }) {
   const [email, setEmail] = useState(config.email)
   const [apiKey, setApiKey] = useState(() => config.apiKey || genApiKey())
+  const [proxyUrl, setProxyUrl] = useState(config.proxyUrl || '')
   const [saved, setSaved] = useState(false)
   const [copied, setCopied] = useState(false)
 
   const save = () => {
-    saveConfig({ email, apiKey, proxyUrl: '' })
-    setConfig({ email, apiKey, proxyUrl: '' })
+    saveConfig({ email, apiKey, proxyUrl })
+    setConfig({ email, apiKey, proxyUrl })
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
   }
@@ -268,7 +287,14 @@ function SetupTab({
     setTimeout(() => setCopied(false), 1500)
   }
 
-  const baseUrl = typeof window !== 'undefined' ? `${window.location.origin}/api/v1` : ''
+  // If using a direct proxy URL, the base URL for Cline is the proxy itself.
+  // Otherwise, it's the Next.js route.
+  const isLocal = typeof window !== 'undefined' && window.location.hostname === 'localhost'
+  const baseUrl = proxyUrl
+    ? `${proxyUrl.replace(/\/+$/, '')}/v1`
+    : isLocal
+      ? `${window.location.origin}/api/v1`
+      : '' // On CF Pages without proxyUrl, Cline can't connect
 
   return (
     <div className="max-w-2xl mx-auto space-y-6">
@@ -299,6 +325,24 @@ function SetupTab({
           />
           <p className="text-xs text-zinc-400 mt-1">
             The Qwen account that the proxy browser session uses to log into chat.qwen.ai
+          </p>
+        </div>
+
+        <div>
+          <Label htmlFor="proxyUrl" className="text-sm font-medium">
+            Proxy URL <span className="text-zinc-400 font-normal">(optional — for CF Pages / remote)</span>
+          </Label>
+          <Input
+            id="proxyUrl"
+            type="text"
+            value={proxyUrl}
+            onChange={(e) => setProxyUrl(e.target.value)}
+            placeholder="http://localhost:3030 or https://my-vps.com"
+            className="mt-1.5 font-mono text-xs"
+          />
+          <p className="text-xs text-zinc-400 mt-1">
+            Leave empty on localhost (uses Next.js routes). Set this if using the CF Pages dashboard
+            to connect directly to your local or VPS proxy — avoids Edge runtime streaming limits.
           </p>
         </div>
 
@@ -345,7 +389,8 @@ function SetupTab({
           <Code2 className="w-4 h-4 text-emerald-400" />
           <span className="text-sm font-medium text-zinc-300">Cline (VS Code) Setup</span>
         </div>
-        <pre className="text-xs text-emerald-300 font-mono whitespace-pre-wrap leading-relaxed">
+        {baseUrl ? (
+          <pre className="text-xs text-emerald-300 font-mono whitespace-pre-wrap leading-relaxed">
 {`1. Open Cline settings in VS Code
 2. API Provider: OpenAI Compatible
 3. Base URL: ${baseUrl}
@@ -359,7 +404,25 @@ curl -N ${baseUrl}/chat/completions \\
   -d '{"model":"qwen3.7-plus",
        "messages":[{"role":"user","content":"Hi"}],
        "stream":true}'`}
-        </pre>
+          </pre>
+        ) : (
+          <div className="text-sm text-amber-300 space-y-2">
+            <p className="font-medium">⚠️ No proxy connected</p>
+            <p className="text-xs text-zinc-400">
+              This dashboard is hosted on Cloudflare Pages (static hosting) and can't run a browser.
+              You need to run the proxy on your own machine or VPS, then enter its URL above.
+            </p>
+            <pre className="text-xs text-zinc-300 bg-zinc-900 rounded p-3 mt-2">
+{`# On your machine / VPS:
+cd mini-services/qwen-proxy
+./manage.sh start
+
+# Then set Proxy URL above to:
+# http://localhost:3030  (if same machine)
+# http://YOUR_VPS_IP:3030  (if on a VPS)`}
+            </pre>
+          </div>
+        )}
       </Card>
 
       {proxyInfo && (
@@ -393,7 +456,7 @@ curl -N ${baseUrl}/chat/completions \\
 // ---------------------------------------------------------------------------
 // Chats Tab
 // ---------------------------------------------------------------------------
-function ChatsTab({ proxyInfo }: { proxyInfo: any }) {
+function ChatsTab({ proxyInfo, proxyUrl }: { proxyInfo: any; proxyUrl?: string }) {
   const [chats, setChats] = useState<QwenChat[]>([])
   const [loading, setLoading] = useState(false)
   const [currentChat, setCurrentChat] = useState<string | null>(null)
@@ -403,7 +466,7 @@ function ChatsTab({ proxyInfo }: { proxyInfo: any }) {
     setLoading(true)
     setError('')
     try {
-      const r = await fetch('/api/v1/chats')
+      const r = await fetch(apiUrl('/chats', proxyUrl))
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       const data = await r.json()
       setChats(data.data || [])
@@ -421,7 +484,7 @@ function ChatsTab({ proxyInfo }: { proxyInfo: any }) {
 
   const selectChat = async (chatId: string) => {
     try {
-      await fetch('/api/v1/chats/select', {
+      await fetch(apiUrl('/chats/select', proxyUrl), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId }),
@@ -434,7 +497,7 @@ function ChatsTab({ proxyInfo }: { proxyInfo: any }) {
 
   const newChat = async () => {
     try {
-      await fetch('/api/v1/chats/new', { method: 'POST' })
+      await fetch(apiUrl('/chats/new', proxyUrl), { method: 'POST' })
       setCurrentChat(null)
       setChats([])
     } catch (e: any) {
@@ -508,7 +571,7 @@ function ChatsTab({ proxyInfo }: { proxyInfo: any }) {
 // ---------------------------------------------------------------------------
 // Playground Tab
 // ---------------------------------------------------------------------------
-function PlaygroundTab() {
+function PlaygroundTab({ proxyUrl }: { proxyUrl?: string }) {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [model, setModel] = useState('qwen3.7-plus')
@@ -547,7 +610,7 @@ function PlaygroundTab() {
     abortRef.current = ac
 
     try {
-      const res = await fetch('/api/v1/chat/completions', {
+      const res = await fetch(apiUrl('/chat/completions', proxyUrl), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, messages: apiMessages, stream: true }),
@@ -614,7 +677,7 @@ function PlaygroundTab() {
     if (streaming) return
     setMessages([])
     // Also tell the proxy to start a new chat
-    fetch('/api/v1/chats/new', { method: 'POST' }).catch(() => {})
+    fetch(apiUrl('/chats/new', proxyUrl), { method: 'POST' }).catch(() => {})
   }
 
   return (
@@ -738,7 +801,7 @@ function TypingDots() {
 // ---------------------------------------------------------------------------
 // Logs Tab
 // ---------------------------------------------------------------------------
-function LogsTab() {
+function LogsTab({ proxyUrl }: { proxyUrl?: string }) {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [loading, setLoading] = useState(false)
   const [filter, setFilter] = useState('all')
@@ -746,7 +809,7 @@ function LogsTab() {
   const fetchLogs = async () => {
     setLoading(true)
     try {
-      const r = await fetch('/api/v1/logs?limit=100')
+      const r = await fetch(apiUrl('/logs?limit=100', proxyUrl))
       if (!r.ok) return
       const data = await r.json()
       setLogs(data.data || [])
@@ -891,14 +954,14 @@ function LogRow({ log }: { log: LogEntry }) {
 // ---------------------------------------------------------------------------
 // Analytics Tab
 // ---------------------------------------------------------------------------
-function AnalyticsTab({ proxyInfo }: { proxyInfo: any }) {
+function AnalyticsTab({ proxyInfo, proxyUrl }: { proxyInfo: any; proxyUrl?: string }) {
   const [analytics, setAnalytics] = useState<Analytics | null>(null)
   const [loading, setLoading] = useState(false)
 
   const fetchAnalytics = async () => {
     setLoading(true)
     try {
-      const r = await fetch('/api/v1/analytics')
+      const r = await fetch(apiUrl('/analytics', proxyUrl))
       if (!r.ok) return
       const data = await r.json()
       setAnalytics(data)
@@ -1024,7 +1087,7 @@ function StatCard({
 // ---------------------------------------------------------------------------
 // Settings Tab
 // ---------------------------------------------------------------------------
-function SettingsTab({ proxyInfo }: { proxyInfo: any }) {
+function SettingsTab({ proxyInfo, proxyUrl }: { proxyInfo: any; proxyUrl?: string }) {
   const [mode, setMode] = useState({
     thinking: true,
     search: false,
@@ -1044,7 +1107,7 @@ function SettingsTab({ proxyInfo }: { proxyInfo: any }) {
     const newMode = { ...mode, [key]: value }
     setMode(newMode)
     try {
-      await fetch('/api/v1/state', {
+      await fetch(apiUrl('/state', proxyUrl), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: newMode }),
@@ -1055,7 +1118,7 @@ function SettingsTab({ proxyInfo }: { proxyInfo: any }) {
   }
 
   const newChat = async () => {
-    await fetch('/api/v1/chats/new', { method: 'POST' })
+    await fetch(apiUrl('/chats/new', proxyUrl), { method: 'POST' })
   }
 
   return (

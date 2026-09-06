@@ -367,7 +367,7 @@ async function streamResponse(
   const startTime = Date.now()
   const POLL_MS = 150
   const STABLE_LIMIT = 14
-  const HARD_TIMEOUT_MS = 120000
+  const HARD_TIMEOUT_MS = 300000 // 5 minutes — allows long essays
 
   await new Promise<void>((resolve) => {
     const poll = async () => {
